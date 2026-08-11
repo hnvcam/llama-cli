@@ -432,16 +432,64 @@ def analyse(md, tensors, use_mtp=False):
     )
 
 
-def kv_cache_bytes(info, n_ctx, kv_type_id, n_seq):
+def kv_cache_bytes(info, n_ctx, kv_type_id, layers=None):
     """Attention KV cache, sized the way llama_kv_cache does it."""
     # llama.cpp pads kv_size up to a multiple of 256 (or n_ubatch); 256 is close enough.
     kv_size = int(math.ceil(n_ctx / 256.0) * 256)
     total = 0
-    for il in info.kv_layers:
+    for il in (info.kv_layers if layers is None else layers):
         total += row_size(kv_type_id, info.n_embd_k_gqa[il] * kv_size)
         if info.n_embd_v_gqa[il]:
             total += row_size(kv_type_id, info.n_embd_v_gqa[il] * kv_size)
     return total
+
+
+# --------------------------------------------------------------------------
+# The MTP draft context
+# --------------------------------------------------------------------------
+#
+# `--spec-type draft-mtp` does NOT just switch a graph on. common/speculative.cpp
+# (common_speculative_init_result) calls llama_init_from_model() a SECOND time on
+# the already-loaded target model with cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP.
+# No model weights are re-read, but a whole second llama_context is built, and a
+# context owns a KV cache and a compute buffer. llama-server prices this itself:
+#
+#   srv load_model: [spec] adding 2203.01 MiB to fit_params_target for device CUDA0
+#   srv load_model: [spec] estimated memory usage of MTP context is 2203.01 MiB
+#
+# (server-context.cpp: `bytes = (has_draft ? dmd[j].model : 0) + dmd[j].context
+# + dmd[j].compute` -- model bytes only for a real draft model, context+compute
+# always.) Measured on LongCat-Flash-Lite Q4_K_M, -c 65535 -ub 512:
+#
+#   target context   KV 2088.00 MiB + compute 983.96 MiB (CUDA0), 150.07 (CUDA1)
+#   MTP context      KV 2088.00 MiB + compute  115.01 MiB (CUDA0),   0.00 (CUDA1)
+#
+# That KV cache is a *full duplicate*: llama_model::create_memory installs an
+# MTP layer filter only for a few archs, and longcat-flash-ngram is not one of
+# them, so the draft context caches all 29 attention layers again. Omitting it
+# is what made an otherwise-plausible plan die at load with
+# "cudaMalloc failed: out of memory ... failed to allocate buffer for kv cache".
+#
+# Archs where llama-model.cpp DOES filter the MTP context's KV down to the
+# nextn blocks (`filter = [](il) { return il >= hparams.n_layer(); }`):
+MTP_KV_FILTERED_ARCHS = {"qwen35", "qwen35moe", "step35", "hy_v3"}
+
+# Fallback for the MTP context's compute buffer. Its graph is one nextn block
+# plus the shared head, so it is far smaller than the target's -- but there is
+# no cheap formula that generalises (see estimate_compute_buffer), so this errs
+# high against the 115.01 MiB measured on LongCat. Use --measure for the real value.
+MTP_COMPUTE_ESTIMATE = 256 * MiB
+
+
+def mtp_kv_cache_bytes(info, n_ctx, kv_type_id):
+    """KV cache of the second context llama.cpp builds for --spec-type draft-mtp."""
+    if info.arch in MTP_KV_FILTERED_ARCHS and info.n_nextn:
+        # only the trailing nextn blocks are cached
+        layers = info.kv_layers[-info.n_nextn:]
+    else:
+        # no filter -> the draft context re-caches every attention layer
+        layers = info.kv_layers
+    return kv_cache_bytes(info, n_ctx, kv_type_id, layers)
 
 
 def recurrent_state_bytes(info, n_seq):
@@ -499,6 +547,12 @@ def estimate_compute_buffer(info, n_ubatch, n_moe_layers):
 
 COMPUTE_BUF_RE = re.compile(
     r"sched_reserve:\s+(CUDA\d+) compute buffer size\s*=\s*([0-9.]+) MiB")
+# Each llama_context finishes its reserve with a "graph nodes = N" line, so that
+# is the section terminator for the compute-buffer sizes printed just above it.
+GRAPH_NODES_RE = re.compile(r"sched_reserve:\s+graph nodes\s*=")
+MTP_CTX_RE = re.compile(r"creating MTP draft context")
+# Emitted once everything is allocated; nothing further is reserved after it.
+SERVER_READY_RE = re.compile(r"listening on http|all slots are idle")
 
 
 # The probe below lands within ~5% of the real compute buffer; this covers the
@@ -523,6 +577,17 @@ def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lo
         the full 7+5 plan                 1031.96 MiB
 
     CUDA1's number came out identical (150.07 MiB) for probe and full plan.
+
+    Returns (target, mtp): two {device: bytes} dicts. `mtp` is empty unless the
+    run created an MTP draft context.
+
+    Parsing note: llama-server reserves graphs several times before the real
+    load -- common_get_device_memory_data() builds throwaway no_alloc contexts
+    to price the MTP context and to fit params. Those dry runs print the same
+    "compute buffer size" lines, so we cannot just take the first ones. Instead
+    we split the log into reserve sections (each ends with "graph nodes = N")
+    and keep the LAST section before the "creating MTP draft context" marker
+    (the real target context) and the last one after it (the real MTP context).
     """
     server = args.llama_server or shutil.which("llama-server")
     if not server:
@@ -555,7 +620,9 @@ def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lo
 
     sys.stderr.write(f"measuring compute buffers via {os.path.basename(server)} "
                      f"(loads the model once, ~1 min)...\n")
-    found = {}
+    section = {}          # devices seen since the last "graph nodes" line
+    target, mtp = {}, {}  # last completed section on each side of the MTP marker
+    seen_mtp = False
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
     try:
@@ -563,8 +630,17 @@ def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lo
         for line in proc.stdout:
             m = COMPUTE_BUF_RE.search(line)
             if m:
-                found[m.group(1)] = int(float(m.group(2)) * MiB)
-            if "CUDA0" in found and "CUDA1" in found:
+                section[m.group(1)] = int(float(m.group(2)) * MiB)
+            elif GRAPH_NODES_RE.search(line):
+                if section:
+                    if seen_mtp:
+                        mtp = section
+                    else:
+                        target = section
+                section = {}
+            elif MTP_CTX_RE.search(line):
+                seen_mtp = True
+            if SERVER_READY_RE.search(line):
                 break
             if "out of memory" in line or "exiting due to" in line:
                 break
@@ -578,16 +654,29 @@ def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lo
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    if "CUDA0" not in found:
+    if "CUDA0" not in target:
         raise SystemExit("error: could not read a CUDA0 compute buffer size from llama-server; "
                          "run it manually with -lv 5 and pass --compute-buf")
-    raw = dict(found)
-    found = {k: int(v * MEASURE_SAFETY) for k, v in found.items()}
+    if mtp_enabled and not mtp:
+        raise SystemExit("error: --measure could not find the MTP draft context's compute "
+                         "buffer; re-run with --no-mtp, or pass --compute-buf")
+
+    def scale(d):
+        return {k: int(v * MEASURE_SAFETY) for k, v in d.items()}
+
+    raw_target, raw_mtp = dict(target), dict(mtp)
+    target, mtp = scale(target), scale(mtp)
     sys.stderr.write(
         "measured: " + ", ".join(
-            f"{k} {fmt_mib(raw[k])} -> {fmt_mib(found[k])} (x{MEASURE_SAFETY})"
-            for k in sorted(raw)) + "\n\n")
-    return found
+            f"{k} {fmt_mib(raw_target[k])} -> {fmt_mib(target[k])} (x{MEASURE_SAFETY})"
+            for k in sorted(raw_target)) + "\n")
+    if raw_mtp:
+        sys.stderr.write(
+            "  MTP ctx: " + ", ".join(
+                f"{k} {fmt_mib(raw_mtp[k])} -> {fmt_mib(mtp[k])} (x{MEASURE_SAFETY})"
+                for k in sorted(raw_mtp)) + "\n")
+    sys.stderr.write("\n")
+    return target, mtp
 
 
 # --------------------------------------------------------------------------
@@ -638,6 +727,8 @@ class Plan:
     kv_bytes: int
     recr_bytes: int
     compute_bytes: int
+    mtp_kv_bytes: int = 0            # second KV cache, --spec-type draft-mtp only
+    mtp_compute_bytes: int = 0       # second compute buffer, ditto
     feasible: bool = True
 
     @property
@@ -875,31 +966,45 @@ def main():
     FAMILY_SIZES["ngram_embd"] = {n for n in lookup_bytes if n.startswith("ngram_embd.")}
 
     kv_name, kv_type = KV_TYPE_Q8_0 if args.q8 else KV_TYPE_F16
-    kv_bytes = kv_cache_bytes(info, args.ctx, kv_type, args.parallel)
+    kv_bytes = kv_cache_bytes(info, args.ctx, kv_type)
     recr_bytes = recurrent_state_bytes(info, args.parallel)
-    measured = {}
+    # --spec-type draft-mtp builds a SECOND llama_context on the same model, with
+    # its own KV cache (usually a full duplicate) and its own compute buffer.
+    mtp_kv_bytes = mtp_kv_cache_bytes(info, args.ctx, kv_type) if mtp_enabled else 0
+    measured, measured_mtp = {}, {}
     if args.compute_buf is not None:
         compute_bytes = args.compute_buf * MiB
         compute_src = "given"
     elif args.measure:
-        measured = measure_compute_buffers(args, args.model, expert_layers,
-                                           expert_suffixes, list(lookup_bytes),
-                                           mtp_enabled=mtp_enabled)
+        measured, measured_mtp = measure_compute_buffers(
+            args, args.model, expert_layers, expert_suffixes, list(lookup_bytes),
+            mtp_enabled=mtp_enabled)
         compute_bytes = measured["CUDA0"]
         compute_src = "measured"
     else:
         compute_bytes = estimate_compute_buffer(info, args.ubatch, len(expert_layers))
         compute_src = "estimated"
 
+    if not mtp_enabled:
+        mtp_compute_bytes = 0
+    elif measured_mtp:
+        mtp_compute_bytes = measured_mtp.get("CUDA0", 0)
+    else:
+        mtp_compute_bytes = MTP_COMPUTE_ESTIMATE
+
     gpu0_budget = gpus[0].total_bytes - args.reserve0 * MiB
     gpu1_budget = gpus[1].total_bytes - args.reserve1 * MiB
-    fixed0 = kv_bytes + recr_bytes + compute_bytes
+    fixed0 = kv_bytes + recr_bytes + compute_bytes + mtp_kv_bytes + mtp_compute_bytes
     # CUDA1 holds only expert weights, but it still takes part in the graph and
     # so allocates its own compute buffer. Measured 328.06 MiB (Ling) and
     # 150.07 MiB (LongCat), so a fraction of CUDA0's with a floor.
     fixed1 = max(int(compute_bytes * args.compute_buf1_frac), 256 * MiB)
     if "CUDA1" in measured:
         fixed1 = max(measured["CUDA1"], 256 * MiB)
+    # The MTP graph only touches the nextn block, whose weights are core tensors
+    # pinned to CUDA0, so llama.cpp reserves nothing on CUDA1 for it (measured
+    # 0.00 MiB on LongCat). Trust a measurement if we have one, add nothing if not.
+    fixed1 += measured_mtp.get("CUDA1", 0)
 
     packed = pack(expert_layers, expert_bytes, lookup_bytes, core_bytes,
                   fixed0, fixed1, gpu0_budget, gpu1_budget)
@@ -913,6 +1018,9 @@ def main():
         e(f"  KV cache @ {args.ctx} ({kv_name})".ljust(38) + f"{fmt_mib(kv_bytes):>12}\n")
         e(f"  recurrent state ({args.parallel} seq)".ljust(38) + f"{fmt_mib(recr_bytes):>12}\n")
         e(f"  compute buffer".ljust(38) + f"{fmt_mib(compute_bytes):>12}\n")
+        if mtp_enabled:
+            e(f"  MTP draft context (KV + compute)".ljust(38)
+              + f"{fmt_mib(mtp_kv_bytes + mtp_compute_bytes):>12}\n")
         e(f"  non-expert weights that must be resident".ljust(38)
           + f"{fmt_mib(core_bytes):>12}\n")
         e(f"  {'':36s}{'-' * 12:>12}\n")
@@ -927,6 +1035,9 @@ def main():
         smaller = max(args.ctx // 2, 4096)
         e(f"  -c {smaller:<16} halves the KV cache\n")
         e(f"  --parallel 1        shrinks the recurrent state\n")
+        if mtp_enabled:
+            e(f"  --no-mtp            drops the second context "
+              f"({fmt_mib(mtp_kv_bytes + mtp_compute_bytes)})\n")
         e(f"  --reserve0 512      reclaims allocator headroom (may OOM at graph reserve)\n")
         raise SystemExit(2)
 
@@ -934,7 +1045,8 @@ def main():
     cpu_bytes = (sum(expert_bytes[i] for i in cpu_layers)
                  + sum(lookup_bytes[n] for n in lk_cpu))
     plan = Plan(g0, g1, cpu_layers, lk_gpu1, lk_cpu, used0, used1, cpu_bytes,
-                gpu0_budget, gpu1_budget, core_bytes, kv_bytes, recr_bytes, compute_bytes)
+                gpu0_budget, gpu1_budget, core_bytes, kv_bytes, recr_bytes, compute_bytes,
+                mtp_kv_bytes, mtp_compute_bytes)
 
     fits_entirely = not plan.cpu_expert_layers and not plan.lookup_cpu
 
@@ -951,6 +1063,7 @@ def main():
             "is_mla": info.is_mla,
             "fits_entirely_on_gpu": fits_entirely,
             "kv_type": kv_name,
+            "mtp_enabled": mtp_enabled,
             "bytes": {
                 "weights_total": weights_bytes,
                 "core": plan.core_bytes,
@@ -958,6 +1071,8 @@ def main():
                 "kv_cache": kv_bytes,
                 "recurrent_state": recr_bytes,
                 "compute_buffer": compute_bytes,
+                "mtp_kv_cache": mtp_kv_bytes,
+                "mtp_compute_buffer": mtp_compute_bytes,
                 "cpu": plan.cpu_bytes,
             },
             "expert_layers": {
@@ -993,9 +1108,12 @@ def main():
     e(f"MoE           : {info.n_expert} experts, {info.n_expert_used} used/token, "
       f"{len(expert_layers)} layers carry expert tensors\n")
     if mtp_enabled:
+        dup = "a full duplicate" if info.arch not in MTP_KV_FILTERED_ARCHS \
+            else f"{info.n_nextn} nextn layer(s)"
         e(f"MTP           : ENABLED -- {info.n_nextn} nextn block(s) present, so the command\n"
-          f"                carries --spec-type draft-mtp and the plan budgets for their\n"
-          f"                weights. Use --no-mtp to turn this off.\n")
+          f"                carries --spec-type draft-mtp. That builds a SECOND llama_context\n"
+          f"                on the same weights: +{fmt_mib(mtp_kv_bytes)} KV ({dup}) and\n"
+          f"                +{fmt_mib(mtp_compute_bytes)} compute on CUDA0. Use --no-mtp to reclaim it.\n")
     elif info.mtp_capable and info.dead_layers:
         e(f"MTP           : available but disabled (--no-mtp); {len(info.dead_layers)} nextn block(s)\n"
           f"                ({fmt_gib(dead_bytes)}) are not loaded by {info.arch}\n")
@@ -1022,6 +1140,12 @@ def main():
     e(f"  compute buffer  ({compute_src})".ljust(33) + f"{fmt_mib(compute_bytes):>12}\n")
     if compute_src == "estimated":
         e("      ^ a coarse upper bound; re-run with --measure for the real value\n")
+    if mtp_enabled:
+        e(f"  MTP draft context".ljust(33)
+          + f"{fmt_mib(mtp_kv_bytes + mtp_compute_bytes):>12}\n")
+        e(f"    second KV cache".ljust(33) + f"{fmt_mib(mtp_kv_bytes):>12}\n")
+        e(f"    second compute buffer".ljust(33) + f"{fmt_mib(mtp_compute_bytes):>12}"
+          + ("   (measured)\n" if measured_mtp else "   (estimated)\n"))
     e("\n")
 
     for i, (gpu, budget, used) in enumerate((
@@ -1036,7 +1160,8 @@ def main():
                     if n not in plan.lookup_gpu1 and n not in plan.lookup_cpu]
                    if i == 0 else plan.lookup_gpu1)
         if i == 0:
-            e(f"      KV + recurrent + compute   {fmt_mib(fixed0):>12}\n")
+            label = "KV + recurrent + compute" + (" + MTP" if mtp_enabled else "")
+            e(f"      {label}".ljust(33) + f"{fmt_mib(fixed0):>12}\n")
             e(f"      core weights               {fmt_mib(plan.core_bytes):>12}\n")
             e(f"      {len(plan.gpu0_expert_layers)} expert layers".ljust(33)
               + f"{fmt_mib(sum(expert_bytes[j] for j in plan.gpu0_expert_layers)):>12}\n")

@@ -124,6 +124,47 @@ architectures — currently `bailingmoe3` — refuse to load nextn blocks at all
 log `model has unused tensor blk.N.* -- ignoring`; with `--no-mtp` those blocks
 are excluded from the budget and that VRAM is reclaimed for experts.
 
+#### `--spec-type draft-mtp` builds a whole second context
+
+This is the expensive part, and it is not the weights. `common_speculative_init_result`
+calls `llama_init_from_model()` a **second time** on the already-loaded target model
+with `ctx_type = LLAMA_CONTEXT_TYPE_MTP`. No weights are re-read — but a context
+owns a KV cache and a compute buffer, and for most architectures llama.cpp installs
+no layer filter on that second KV cache, so it is a *full duplicate*. llama-server
+prices it itself:
+
+```
+srv load_model: [spec] adding 2203.01 MiB to fit_params_target for device CUDA0
+srv load_model: [spec] estimated memory usage of MTP context is 2203.01 MiB
+```
+
+Measured on LongCat-Flash-Lite Q4_K_M at `-c 65535 -ub 512`:
+
+| | KV cache | compute (CUDA0) | compute (CUDA1) |
+| --- | --- | --- | --- |
+| target context | 2088.00 MiB | 983.96 MiB | 150.07 MiB |
+| MTP context | 2088.00 MiB | 115.01 MiB | 0.00 MiB |
+
+So MTP costs **2.2 GiB on CUDA0 here — about 1.6 expert layers** — before you count
+the nextn weights. The planner budgets all of it. The archs where llama.cpp *does*
+filter the MTP KV down to just the nextn blocks (`qwen35`, `qwen35moe`, `step35`,
+`hy_v3`) are listed in `MTP_KV_FILTERED_ARCHS`; everything else gets the duplicate.
+
+Getting this wrong is not a rounding error — it loads the target model fine and then
+dies at the very last allocation:
+
+```
+common_speculative_init_result: creating MTP draft context against the target model
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 2088.00 MiB on device 0: cudaMalloc failed: out of memory
+llama_init_from_model: failed to initialize the context: failed to allocate buffer for kv cache
+srv load_model: failed to create MTP context
+```
+
+Note that `-ngl 99` disables llama.cpp's own auto-fit (`failed to fit params to free
+device memory: n_gpu_layers already set by user to 99, abort`), so nothing else is
+going to catch this for you. Under `--measure` the second context's compute buffer
+is read from the log too, alongside the target's.
+
 ### Compute buffer sizing
 
 This is the one number that cannot be derived from the GGUF, and the three flags
@@ -225,12 +266,18 @@ In strict priority order:
 the CPU.** In my use it did not pay for itself there. Two things go wrong, and it
 is worth separating them because only one is obvious.
 
-**1. It costs VRAM you needed for experts.** With MTP enabled the nextn block
-weights must be resident, and the planner budgets for them. On an architecture
-like `bailingmoe3` — which does not even load those blocks unless you ask for MTP
-— that is 1.55 GiB on Ling 3.0 Flash, against an expert layer size of 1,530 MiB.
-So enabling MTP costs almost exactly one whole expert layer, evicted from GPU to
-CPU, permanently, on every token — bought to fund a speculative gamble.
+**1. It costs VRAM you needed for experts.** Two separate charges:
+
+*The nextn block weights must be resident.* On an architecture like `bailingmoe3` —
+which does not even load those blocks unless you ask for MTP — that is 1.55 GiB on
+Ling 3.0 Flash, against an expert layer size of 1,530 MiB.
+
+*And the second context costs more than the weights do.* As above: a duplicate KV
+cache plus a second compute buffer, 2,203 MiB on LongCat at 64K context. That one
+scales with `-c`, so it gets worse exactly where you wanted the context.
+
+Together, on LongCat, MTP moves **two more expert layers** from GPU to CPU,
+permanently, on every token — bought to fund a speculative gamble.
 
 **2. Batched verification stops amortising on CPU-resident experts.** This is the
 part worth being precise about, and it is a refinement of "MoE experts don't seem
@@ -327,6 +374,12 @@ regex by hand.
   direction: over-counting only wastes packing efficiency, while under-counting
   silently overcommits VRAM and OOMs. If you see `unused tensor blk.N.*` warnings
   for another architecture, add it there and reclaim the VRAM.
+- `MTP_KV_FILTERED_ARCHS` is likewise hand-maintained, and errs the same way:
+  anything unlisted is assumed to duplicate the *whole* KV cache in the MTP draft
+  context. If your arch gained an MTP layer filter in `llama_model::create_memory`,
+  add it there. The MTP compute-buffer fallback (`MTP_COMPUTE_ESTIMATE`, 256 MiB)
+  is a generous stand-in for the 115 MiB measured on LongCat; `--measure` reads
+  the real one.
 - The ggml type table is dumped from `libggml-base.so` at b10277. A future ggml
   release that renumbers or adds types will need it refreshed.
 - All overrides are emitted as a **single** `-ot` argument, because b10277 warns
