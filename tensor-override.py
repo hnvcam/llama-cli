@@ -274,6 +274,8 @@ class ModelInfo:
     n_embd_v_gqa: dict = field(default_factory=dict)  # layer -> V row elements (0 under MLA)
     n_embd_r: int = 0                  # recurrent conv-state row elements
     n_embd_s: int = 0                  # recurrent ssm-state row elements
+    n_swa: int = 0                     # sliding-window width, 0 = no SWA
+    swa_layers: list = field(default_factory=list)    # layers on the small SWA cache
 
 
 # Architectures observed to leave their nextn/MTP block weights unloaded on
@@ -459,6 +461,14 @@ def analyse(md, tensors, use_mtp=False):
             n_embd_r = ((d_conv - 1) if d_conv > 0 else 0) * (d_inner + 2 * n_group * d_state)
             n_embd_s = d_state * d_inner
 
+    # --- sliding-window attention -------------------------------------------
+    # Layers llama.cpp puts on the small SWA cache instead of the n_ctx one.
+    # Restricted to main_kv_layers: a layer with no KV row cannot be on either.
+    n_swa, swa_all = resolve_swa(md, arch, n_layer, n_layer_all, recr_layers)
+    swa_layers = [il for il in main_kv_layers if il in set(swa_all)]
+    if not swa_layers:
+        n_swa = 0
+
     return ModelInfo(
         arch=arch,
         name=md.get("general.name", "?"),
@@ -482,18 +492,181 @@ def analyse(md, tensors, use_mtp=False):
         n_embd_v_gqa=n_embd_v_gqa,
         n_embd_r=n_embd_r,
         n_embd_s=n_embd_s,
+        n_swa=n_swa,
+        swa_layers=swa_layers,
     )
 
 
-def kv_cache_bytes(info, n_ctx, kv_type_id, layers=None):
-    """Attention KV cache, sized the way llama_kv_cache does it."""
-    # llama.cpp pads kv_size up to a multiple of 256 (or n_ubatch); 256 is close enough.
-    kv_size = int(math.ceil(n_ctx / 256.0) * 256)
+# --------------------------------------------------------------------------
+# Sliding-window attention
+# --------------------------------------------------------------------------
+#
+# An arch that sets hparams.swa_type != NONE does NOT get one n_ctx-cell KV row
+# per layer. llama_model::create_memory builds a llama_kv_cache_iswa instead
+# (llama-model.cpp:2312 hybrid, :2383 pure attention), which is TWO caches with
+# a layer filter (llama-kv-cache-iswa.cpp:44-105):
+#
+#   base   non-SWA layers,  size_base = n_ctx_seq
+#   swa    SWA layers,      size_swa  = GGML_PAD(min(size_base,
+#                                         n_swa*(unified ? n_seq_max : 1)
+#                                         + n_ubatch), 256)
+#
+# For gpt-oss (n_swa = 128, every other layer SWA) at -c 65535 -ub 512 that is
+# 1024 cells against 65536, so half the model's KV costs 1.5% of what a flat
+# n_ctx row would. Measured, gpt-oss-120b Q8_0, -c 65535 -ub 512, f16 KV:
+#
+#   llama_kv_cache_iswa: creating non-SWA KV cache, size = 65536 cells
+#   llama_kv_cache: size = 2304.00 MiB (65536 cells, 18 layers, 4/1 seqs)
+#   llama_kv_cache_iswa: creating     SWA KV cache, size = 1024 cells
+#   llama_kv_cache: size =   36.00 MiB ( 1024 cells, 18 layers, 4/1 seqs)
+#
+# 2340 MiB, where sizing all 36 layers flat gives 4608 MiB. The 2268 MiB of
+# phantom KV cost two whole expert layers of CUDA0 packing, which is what this
+# script used to do.
+#
+# Each cache is allocated per stream: llama-kv-cache.cpp:82 sets
+# n_stream = unified ? 1 : n_seq_max, and :231 allocates [row, kv_size,
+# n_stream]. llama-context.cpp:292 sets n_ctx_seq = n_ctx / n_seq_max when NOT
+# unified, so the base cache totals n_ctx cells either way -- but the SWA cache
+# does not, because its size is a floor: it totals size_swa * n_stream.
+#
+# llama-server's default is -np -1 ("auto"), which is n_parallel = 4 with
+# kv_unified = true (tools/server/server.cpp:152-158), matching this script's
+# --parallel 4 default. --swa-full (llama.cpp's --swa-full) sizes the SWA cache
+# like the base one and is priced by passing swa_full=True.
+
+
+@dataclass(frozen=True)
+class SwaRule:
+    """
+    How one arch's load_arch_hparams() decides is_swa(il), condensed from
+    src/models/<arch>.cpp. An arch missing from SWA_ARCHS is priced with no SWA
+    at all, which over-counts rather than OOMs.
+    """
+    period: int = 2             # swa_period default when the GGUF omits the pattern key
+    dense_first: bool = False   # set_swa_pattern(period, dense_first)
+    n_swa_default: int = 0      # n_swa the loader hard-codes before reading the key
+    needs_key: bool = True      # SWA only when attention.sliding_window is present and > 0
+    array_only: bool = False    # loader reads the pattern straight into is_swa_impl
+    all_layers: bool = False    # every attention layer is SWA
+    non_recurrent: bool = False # SWA on exactly the non-recurrent layers (lfm2)
+
+
+# Verified against src/models/*.cpp on this llama.cpp checkout. The comment on
+# each line is the file that justifies it.
+SWA_ARCHS = {
+    "gpt-oss":          SwaRule(period=2),                        # openai-moe.cpp:8
+    "gemma2":           SwaRule(period=2, n_swa_default=4096, needs_key=False),  # gemma2.cpp:4
+    "gemma3":           SwaRule(period=6),                        # gemma3.cpp:7
+    "gemma3n":          SwaRule(period=5),                        # gemma3n.cpp:4
+    "gemma4":           SwaRule(array_only=True),                 # gemma4.cpp:5
+    "gemma4-assistant": SwaRule(array_only=True),                 # gemma4-assistant.cpp:7
+    "gemma-embedding":  SwaRule(period=6),                        # gemma-embedding.cpp:5
+    "cohere2":          SwaRule(period=4),                        # cohere2.cpp:5
+    "cohere2moe":       SwaRule(period=4, dense_first=True),      # cohere2moe.cpp:33
+    "exaone-moe":       SwaRule(period=4, n_swa_default=128, needs_key=False),   # exaone-moe.cpp:5
+    "llama4":           SwaRule(period=4, n_swa_default=8192),    # llama4.cpp:14,19
+    "afmoe":            SwaRule(period=4),                        # afmoe.cpp:17
+    "laguna":           SwaRule(period=4, dense_first=True),      # laguna.cpp:41
+    "deepseek4":        SwaRule(all_layers=True),                 # deepseek4.cpp:68
+    "dflash":           SwaRule(array_only=True),                 # dflash.cpp:74
+    "graniteswitch":    SwaRule(array_only=True),                 # granite-swa.cpp:17
+    "modern-bert":      SwaRule(period=3, dense_first=True),      # modern-bert.cpp:10
+    "lfm2":             SwaRule(non_recurrent=True),              # lfm2.cpp:29
+    "lfm2moe":          SwaRule(non_recurrent=True),              # lfm2.cpp:29
+    # exaone4 arms SWA only at n_layer() == 64 (exaone4.cpp:7); handled below.
+    "exaone4":          SwaRule(period=4, n_swa_default=4096, needs_key=False),
+}
+
+
+def swa_pattern_flags(period, dense_first, n_layer, n_layer_all):
+    """llama_hparams::set_swa_pattern (llama-hparams.cpp)."""
+    flags = [False] * n_layer_all
+    for il in range(min(n_layer, n_layer_all)):
+        if dense_first:
+            flags[il] = period == 0 or (il % period != 0)
+        else:
+            flags[il] = period == 0 or (il % period < period - 1)
+    return flags
+
+
+def resolve_swa(md, arch, n_layer, n_layer_all, recr_layers):
+    """
+    -> (n_swa, [layer indices that are SWA]).
+
+    Returns (0, []) for any arch this script cannot pin down from the GGUF, so
+    those keep the old flat-n_ctx accounting.
+    """
+    rule = SWA_ARCHS.get(arch)
+    if rule is None:
+        return 0, []
+    if arch == "exaone4" and n_layer != 64:
+        return 0, []
+
+    n_swa = int(_mdget(md, arch, "attention.sliding_window", 0) or 0)
+    if not n_swa:
+        if rule.needs_key:
+            return 0, []
+        n_swa = rule.n_swa_default
+    if n_swa <= 0:
+        return 0, []
+
+    pattern = _mdget(md, arch, "attention.sliding_window_pattern")
+    if isinstance(pattern, list):
+        # get_key_or_arr with a per-layer array -> is_swa_impl verbatim
+        flags = [bool(v) for v in pattern][:n_layer_all]
+        flags += [False] * (n_layer_all - len(flags))
+    elif rule.array_only:
+        # the loader requires the array and we do not have it -- do not guess
+        return 0, []
+    elif rule.non_recurrent:
+        recr = set(recr_layers)
+        flags = [il not in recr for il in range(n_layer_all)]
+    elif rule.all_layers:
+        flags = [True] * n_layer_all
+    else:
+        period = int(pattern) if pattern is not None else rule.period
+        flags = swa_pattern_flags(period, rule.dense_first, n_layer, n_layer_all)
+
+    return n_swa, [il for il, is_swa in enumerate(flags) if is_swa]
+
+
+def kv_cell_counts(info, n_ctx, n_seq=1, n_ubatch=512, unified=True, swa_full=False):
+    """
+    -> (cells per non-SWA layer, cells per SWA layer, n_stream), summed over
+    streams. Mirrors llama-context.cpp:288-304 and llama-kv-cache-iswa.cpp:69-81.
+    """
+    n_ctx = int(math.ceil(n_ctx / 256.0) * 256)          # cparams.n_ctx
+    n_seq = max(int(n_seq), 1)
+    n_stream = 1 if unified else n_seq
+    size_base = n_ctx if unified else int(math.ceil(n_ctx / n_seq / 256.0) * 256)
+    if not info.swa_layers or swa_full:
+        return size_base * n_stream, size_base * n_stream, n_stream
+    window = info.n_swa * (n_seq if unified else 1) + n_ubatch
+    size_swa = int(math.ceil(min(size_base, window) / 256.0) * 256)
+    return size_base * n_stream, size_swa * n_stream, n_stream
+
+
+def layer_kv_bytes(info, il, kv_type_id, cells):
+    total = row_size(kv_type_id, info.n_embd_k_gqa[il] * cells)
+    if info.n_embd_v_gqa[il]:
+        total += row_size(kv_type_id, info.n_embd_v_gqa[il] * cells)
+    return total
+
+
+def kv_cache_bytes(info, n_ctx, kv_type_id, layers=None,
+                   n_seq=1, n_ubatch=512, unified=True, swa_full=False):
+    """
+    Attention KV cache, sized the way llama_kv_cache_iswa does it: SWA layers
+    get the small window cache, everything else gets the full n_ctx one.
+    """
+    base_cells, swa_cells, _ = kv_cell_counts(info, n_ctx, n_seq, n_ubatch,
+                                              unified, swa_full)
+    swa = set(info.swa_layers)
     total = 0
     for il in (info.main_kv_layers if layers is None else layers):
-        total += row_size(kv_type_id, info.n_embd_k_gqa[il] * kv_size)
-        if info.n_embd_v_gqa[il]:
-            total += row_size(kv_type_id, info.n_embd_v_gqa[il] * kv_size)
+        total += layer_kv_bytes(info, il, kv_type_id,
+                                swa_cells if il in swa else base_cells)
     return total
 
 
@@ -534,7 +707,8 @@ MTP_KV_FILTERED_ARCHS = {"qwen35", "qwen35moe", "step35", "hy_v3"}
 MTP_COMPUTE_ESTIMATE = 256 * MiB
 
 
-def mtp_kv_cache_bytes(info, n_ctx, kv_type_id=None):
+def mtp_kv_cache_bytes(info, n_ctx, kv_type_id=None, n_seq=1, n_ubatch=512,
+                       unified=True, swa_full=False):
     """
     KV cache of the second context llama.cpp builds for --spec-type draft-mtp.
 
@@ -550,7 +724,8 @@ def mtp_kv_cache_bytes(info, n_ctx, kv_type_id=None):
     else:
         # no filter -> the draft context re-caches every attention layer
         layers = info.kv_layers
-    return kv_cache_bytes(info, n_ctx, KV_TYPE_F16[1], layers)
+    return kv_cache_bytes(info, n_ctx, KV_TYPE_F16[1], layers,
+                          n_seq, n_ubatch, unified, swa_full)
 
 
 def recurrent_state_bytes(info, n_seq, n_rs_seq=0):
@@ -1160,6 +1335,9 @@ def dense_fit(info, args, layer_bytes, out_bytes, budgets, n_ctx, kv_type,
               boundary, compute_base, mtp_enabled):
     """Price one candidate layer boundary across the two cards."""
     kv_size = int(math.ceil(n_ctx / 256.0) * 256)
+    base_cells, swa_cells, _ = kv_cell_counts(info, n_ctx, args.parallel, args.ubatch,
+                                              args.kv_unified, args.swa_full)
+    swa_set = set(info.swa_layers)
     dev = lambda il: 0 if il < boundary else 1
 
     weights = [0, 0]
@@ -1170,10 +1348,8 @@ def dense_fit(info, args, layer_bytes, out_bytes, budgets, n_ctx, kv_type,
 
     kv = [0, 0]
     for il in info.main_kv_layers:
-        d = dev(il)
-        kv[d] += row_size(kv_type, info.n_embd_k_gqa[il] * kv_size)
-        if info.n_embd_v_gqa[il]:
-            kv[d] += row_size(kv_type, info.n_embd_v_gqa[il] * kv_size)
+        kv[dev(il)] += layer_kv_bytes(info, il, kv_type,
+                                      swa_cells if il in swa_set else base_cells)
 
     n_rs_seq = rs_rollback_depth(info, args, mtp_enabled)
     rs_per_layer = ((row_size(0, info.n_embd_r) + row_size(0, info.n_embd_s))
@@ -1195,10 +1371,8 @@ def dense_fit(info, args, layer_bytes, out_bytes, budgets, n_ctx, kv_type,
                   if info.arch in MTP_KV_FILTERED_ARCHS and info.n_nextn
                   else info.kv_layers)
         for il in cached:
-            d = dev(il)
-            mtp[d] += row_size(KV_TYPE_F16[1], info.n_embd_k_gqa[il] * kv_size)
-            if info.n_embd_v_gqa[il]:
-                mtp[d] += row_size(KV_TYPE_F16[1], info.n_embd_v_gqa[il] * kv_size)
+            mtp[dev(il)] += layer_kv_bytes(info, il, KV_TYPE_F16[1],
+                                           swa_cells if il in swa_set else base_cells)
         mtp[dev(cached[-1]) if cached else 0] += mtp_compute_buffer(
             info, n_ctx, args.ubatch, args.parallel)
 
@@ -1475,6 +1649,16 @@ def main():
     ap.add_argument("-c", "--ctx", type=int, default=65535, help="context size (default 65535)")
     ap.add_argument("-ub", "--ubatch", type=int, default=512,
                     help="physical batch size, drives the compute-buffer estimate (default 512)")
+    ap.add_argument("--swa-full", action="store_true",
+                    help="price the SWA KV cache at full n_ctx, i.e. plan for "
+                         "llama.cpp's --swa-full. Without it, SWA layers are sized at "
+                         "GGML_PAD(min(n_ctx_seq, n_swa*n_seq_max + n_ubatch), 256) "
+                         "cells, which is what llama_kv_cache_iswa actually allocates.")
+    ap.add_argument("--no-kv-unified", dest="kv_unified", action="store_false", default=True,
+                    help="plan for a per-slot (non-unified) KV cache. llama-server's "
+                         "default -np -1 means 4 slots with kv_unified = true "
+                         "(server.cpp:152-158), which is the default here; pass this only "
+                         "if you also pass an explicit -np N to llama-server.")
     ap.add_argument("--parallel", type=int, default=4,
                     help="number of server slots; sizes the recurrent state. llama-server's "
                          "default is auto -> 4 slots with kv_unified, so 4 is the default here too.")
@@ -1591,12 +1775,15 @@ def main():
     FAMILY_SIZES["ngram_embd"] = {n for n in lookup_bytes if n.startswith("ngram_embd.")}
 
     kv_name, kv_type = KV_TYPE_Q8_0 if args.q8 else KV_TYPE_F16
-    kv_bytes = kv_cache_bytes(info, args.ctx, kv_type)
+    kv_bytes = kv_cache_bytes(info, args.ctx, kv_type, None, args.parallel,
+                              args.ubatch, args.kv_unified, args.swa_full)
     recr_bytes = recurrent_state_bytes(info, args.parallel,
                                        rs_rollback_depth(info, args, mtp_enabled))
     # --spec-type draft-mtp builds a SECOND llama_context on the same model, with
     # its own KV cache (usually a full duplicate) and its own compute buffer.
-    mtp_kv_bytes = mtp_kv_cache_bytes(info, args.ctx) if mtp_enabled else 0
+    mtp_kv_bytes = (mtp_kv_cache_bytes(info, args.ctx, None, args.parallel,
+                                       args.ubatch, args.kv_unified, args.swa_full)
+                    if mtp_enabled else 0)
     measured, measured_mtp = {}, {}
     if args.compute_buf is not None:
         compute_bytes = args.compute_buf * MiB
@@ -1762,6 +1949,13 @@ def main():
     e(f"    expert tensors               {fmt_gib(total_expert_bytes):>12}"
       f"   ({len(expert_layers)} layers, {fmt_mib(total_expert_bytes / max(len(expert_layers),1))}/layer)\n")
     e(f"  KV cache @ {args.ctx} ({kv_name})".ljust(33) + f"{fmt_mib(kv_bytes):>12}\n")
+    if info.swa_layers:
+        base_cells, swa_cells, _ = kv_cell_counts(info, args.ctx, args.parallel,
+                                                  args.ubatch, args.kv_unified,
+                                                  args.swa_full)
+        e(f"      {len(info.main_kv_layers) - len(info.swa_layers)} full layers "
+          f"@ {base_cells} cells, {len(info.swa_layers)} SWA "
+          f"@ {swa_cells} (n_swa {info.n_swa})\n")
     e(f"  recurrent state ({args.parallel} seq)".ljust(33) + f"{fmt_mib(recr_bytes):>12}\n")
     e(f"  compute buffer  ({compute_src})".ljust(33) + f"{fmt_mib(compute_bytes):>12}\n")
     if compute_src == "estimated":
