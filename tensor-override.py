@@ -21,6 +21,19 @@ layers by *free VRAM* and the KV cache would be spread over both GPUs. So to
 honour rule 1 we emit `-ts 1,0`, pinning every layer (hence all KV) to CUDA0,
 and then use `-ot` to push expert weights out to CUDA1/CPU.
 
+Dense models (no `*_exps.*` tensors) have nothing `-ot` can usefully relocate,
+since every weight is read on every token. For those the script switches to a
+layer-split planner instead: it walks every possible split point, prices each
+card SEPARATELY (weights + its share of the KV cache + its share of the
+recurrent state + its own full compute buffer), and reports the largest `-c`
+that fits together with the `-ts` that balances the two cards. See dense_report().
+
+Pricing the two cards as one pooled budget -- which this script used to do --
+is the trap: llama.cpp fills the small card first, so a plan that looks like it
+has gigabytes spare can still die on the small card's compute buffer. And that
+compute buffer is not a constant: it carries an `n_kv * n_ubatch * 4 * n_seq`
+KQ mask, so it grows with `-c` on BOTH cards. See DENSE_COMPUTE_BASE.
+
 Usage:
     ./tensor-override.py MODEL.gguf [-q8] [-c CTX] [options]
 """
@@ -251,7 +264,8 @@ class ModelInfo:
     n_ff_exp: int
     recr_layers: list = field(default_factory=list)   # recurrent (SSM/KDA) layers
     attn_layers: list = field(default_factory=list)   # live attention layers
-    kv_layers: list = field(default_factory=list)     # layers llama.cpp gives a KV row (incl. dead MTP)
+    kv_layers: list = field(default_factory=list)     # layers carrying attention weights (incl. dead MTP)
+    main_kv_layers: list = field(default_factory=list) # layers the MAIN context gives a KV row
     is_mla: bool = False
     n_nextn: int = 0                   # trailing MTP/nextn blocks declared by the model
     mtp_capable: bool = False          # nextn blocks declared AND their tensors present
@@ -266,7 +280,28 @@ class ModelInfo:
 # llama.cpp b10277 (they log "model has unused tensor blk.<N>.* -- ignoring").
 # Anything not listed here is assumed to load them, which is the safe guess.
 # If you see those warnings for another arch, add it and reclaim the VRAM.
-NEXTN_IGNORED_ARCHS = {"bailingmoe3"}
+#
+#   bailingmoe3  Ling 3.0: 21 warnings for blk.42.*
+#   qwen35       Qwen3.8-27B: 15 warnings for blk.64.* (334.75 MiB)
+#
+# Note what this list does NOT mean. qwen35.cpp:41 reads
+#     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
+# and common.cpp:1689 sets load_mtp from `--spec-type draft-mtp`, so those
+# warnings appear precisely BECAUSE MTP was not requested. The arch supports
+# MTP fine; the block is dead weight only while MTP is off.
+NEXTN_IGNORED_ARCHS = {"bailingmoe3", "qwen35"}
+
+# --spec-type draft-mtp on a recurrent model also has to checkpoint the SSM
+# state so a rejected draft can be rolled back: common.h:391 sets
+# cparams.n_rs_seq = speculative.draft.n_max (default 3), and the recurrent
+# buffer is then sized for (1 + n_rs_seq) copies. llama-context.cpp:105 clamps
+# it back to 0 for archs outside this list (llama-arch.cpp:1028).
+#
+# Measured on Qwen3.8-27B, 4 slots:  598.50 MiB off -> 2394.00 MiB on. That is
+# +1795.50 MiB, by far the largest single cost of turning MTP on, and nothing
+# in the old accounting knew about it.
+RS_ROLLBACK_ARCHS = {"qwen35", "qwen35moe", "deepseek4",
+                     "nemotron_h", "nemotron_h_moe", "lfm2", "lfm2moe"}
 
 
 def _mdget(md, arch, key, default=None):
@@ -341,11 +376,13 @@ def analyse(md, tensors, use_mtp=False):
     # A layer is recurrent if it carries ssm_* weights; it owns a KV cache if it
     # carries real attention projections. This survives archs whose head_count_kv
     # stays non-zero on recurrent layers (e.g. qwen35moe).
-    # kv_layers deliberately INCLUDES dead MTP blocks: llama.cpp refuses to load
-    # their weights ("unused tensor blk.42.* -- ignoring") but still allocates a
-    # KV cache row for them. Measured on Ling: KV = 306.00 MiB = 8 * 576 * 65536
-    # * 34/32, i.e. 8 attention layers, of which blk.42 is one -- 7 would give
-    # 267.75 MiB. Excluding it here under-counts by a full layer of KV.
+    # kv_layers deliberately INCLUDES dead MTP blocks: on bailingmoe3 llama.cpp
+    # refuses to load their weights ("unused tensor blk.42.* -- ignoring") but
+    # still allocates a KV cache row for them. Measured on Ling: KV = 306.00 MiB
+    # = 8 * 576 * 65536 * 34/32, i.e. 8 attention layers, of which blk.42 is one
+    # -- 7 would give 267.75 MiB. Excluding it there under-counts by a full layer.
+    # main_kv_layers, built below, is the subset the MAIN context actually caches;
+    # that is what sizing should use, and on some archs it is smaller.
     recr_layers, attn_layers, kv_layers = [], [], []
     is_mla = False
     for il in range(n_layer_all):
@@ -364,6 +401,21 @@ def analyse(md, tensors, use_mtp=False):
             if il not in dead_layers:
                 attn_layers.append(il)
             is_mla = is_mla or has_mla
+
+    # Whether the MAIN context also caches the nextn blocks is arch-specific.
+    # llama-model.cpp installs `filter = [](il) { return il >= n_layer; }` on the
+    # MTP context for MTP_KV_FILTERED_ARCHS, which by construction keeps them out
+    # of the main one. Measured on Qwen3.8-27B (qwen35, 16 of 65 blocks are full
+    # attention, blk.64 is nextn):
+    #   llama_kv_cache: size = 1088.00 MiB (32768 cells, 16 layers, 4/1 seqs)
+    # i.e. 16, not 17 -- blk.64 gets no row. On bailingmoe3, which has no such
+    # filter, the dead nextn block DOES get one (306.00 MiB = 8 layers on Ling,
+    # blk.42 among them), so the two cases must be kept apart.
+    nextn_blocks = set(range(max(n_layer - n_nextn, 0), n_layer_all)) if n_nextn else set()
+    if arch in MTP_KV_FILTERED_ARCHS:
+        main_kv_layers = [il for il in kv_layers if il not in nextn_blocks]
+    else:
+        main_kv_layers = list(kv_layers)
 
     # --- KV row widths, mirroring llama_hparams::n_embd_{k,v}_gqa ------------
     head_count_kv = _per_layer(_mdget(md, arch, "attention.head_count_kv"), n_layer_all,
@@ -421,6 +473,7 @@ def analyse(md, tensors, use_mtp=False):
         recr_layers=recr_layers,
         attn_layers=attn_layers,
         kv_layers=kv_layers,
+        main_kv_layers=main_kv_layers,
         is_mla=is_mla,
         n_nextn=n_nextn,
         mtp_capable=mtp_capable,
@@ -437,7 +490,7 @@ def kv_cache_bytes(info, n_ctx, kv_type_id, layers=None):
     # llama.cpp pads kv_size up to a multiple of 256 (or n_ubatch); 256 is close enough.
     kv_size = int(math.ceil(n_ctx / 256.0) * 256)
     total = 0
-    for il in (info.kv_layers if layers is None else layers):
+    for il in (info.main_kv_layers if layers is None else layers):
         total += row_size(kv_type_id, info.n_embd_k_gqa[il] * kv_size)
         if info.n_embd_v_gqa[il]:
             total += row_size(kv_type_id, info.n_embd_v_gqa[il] * kv_size)
@@ -481,21 +534,42 @@ MTP_KV_FILTERED_ARCHS = {"qwen35", "qwen35moe", "step35", "hy_v3"}
 MTP_COMPUTE_ESTIMATE = 256 * MiB
 
 
-def mtp_kv_cache_bytes(info, n_ctx, kv_type_id):
-    """KV cache of the second context llama.cpp builds for --spec-type draft-mtp."""
+def mtp_kv_cache_bytes(info, n_ctx, kv_type_id=None):
+    """
+    KV cache of the second context llama.cpp builds for --spec-type draft-mtp.
+
+    It comes out f16 whatever -ctk/-ctv say. Measured on Qwen3.8-27B run with
+    -ctk q8_0 -ctv q8_0:
+        llama_kv_cache: size = 256.00 MiB (65536 cells, 1 layers, ...), K (f16)
+    which is 1 layer * 65536 * (1024+1024) * 2 B exactly. Sizing it at q8_0
+    would under-count it by nearly half.
+    """
     if info.arch in MTP_KV_FILTERED_ARCHS and info.n_nextn:
         # only the trailing nextn blocks are cached
         layers = info.kv_layers[-info.n_nextn:]
     else:
         # no filter -> the draft context re-caches every attention layer
         layers = info.kv_layers
-    return kv_cache_bytes(info, n_ctx, kv_type_id, layers)
+    return kv_cache_bytes(info, n_ctx, KV_TYPE_F16[1], layers)
 
 
-def recurrent_state_bytes(info, n_seq):
-    """SSM/KDA state -- one row per sequence, always f32, independent of n_ctx."""
+def recurrent_state_bytes(info, n_seq, n_rs_seq=0):
+    """
+    SSM/KDA state -- one row per sequence, always f32, independent of n_ctx.
+
+    n_rs_seq is the speculative rollback depth; the buffer holds (1 + n_rs_seq)
+    copies. Measured on Qwen3.8-27B with 4 slots: 598.50 MiB at n_rs_seq=0 and
+    2394.00 MiB at n_rs_seq=3, exactly 4x.
+    """
     per_layer = row_size(0, info.n_embd_r) + row_size(0, info.n_embd_s)
-    return per_layer * len(info.recr_layers) * n_seq
+    return per_layer * len(info.recr_layers) * n_seq * (1 + n_rs_seq)
+
+
+def rs_rollback_depth(info, args, mtp_enabled):
+    """cparams.n_rs_seq: the draft depth, but only on archs that can roll back."""
+    if not mtp_enabled or info.arch not in RS_ROLLBACK_ARCHS or not info.recr_layers:
+        return 0
+    return max(args.draft_max, 0)
 
 
 # Measured on this box (llama.cpp b10277, driver 580.173, CUDA 13, RTX 5070 Ti).
@@ -560,6 +634,39 @@ SERVER_READY_RE = re.compile(r"listening on http|all slots are idle")
 MEASURE_SAFETY = 1.06
 
 
+# llama-server lookup for --measure. The checkout sitting next to this script
+# is the one these scripts are written against, so it goes first -- ahead of
+# whatever stale llama-server happens to be on $PATH.
+LLAMA_SERVER_SEARCH = (
+    "../llama.cpp/build/bin/llama-server",
+    "../llama.cpp/build/tools/server/llama-server",
+    "../llama.cpp*/build/bin/llama-server",
+    "~/Workplace/llama.cpp*/build/bin/llama-server",
+)
+
+
+def llama_server_candidates():
+    """Search paths in priority order, resolved relative to this script's directory."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = []
+    for pat in LLAMA_SERVER_SEARCH:
+        pat = os.path.expanduser(pat)
+        if not os.path.isabs(pat):
+            pat = os.path.normpath(os.path.join(here, pat))
+        if pat not in out:      # ~/Workplace/... collapses onto ../... when the
+            out.append(pat)     # script already lives under ~/Workplace
+    return out
+
+
+def find_llama_server():
+    """First existing candidate, else whatever $PATH offers."""
+    for pat in llama_server_candidates():
+        for cand in sorted(glob.glob(pat)):
+            if os.path.exists(cand):
+                return cand
+    return shutil.which("llama-server")
+
+
 def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lookup_names,
                             mtp_enabled=False):
     """
@@ -589,13 +696,14 @@ def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lo
     and keep the LAST section before the "creating MTP draft context" marker
     (the real target context) and the last one after it (the real MTP context).
     """
-    server = args.llama_server or shutil.which("llama-server")
-    if not server:
-        for cand in sorted(glob.glob(os.path.expanduser("~/Workplace/llama.cpp*/build/bin/llama-server"))):
-            server = cand
-            break
+    server = args.llama_server or find_llama_server()
     if not server or not os.path.exists(server):
-        raise SystemExit("error: --measure needs llama-server; pass --llama-server PATH")
+        raise SystemExit(
+            "error: --measure needs llama-server, and none was found. Looked in:\n"
+            + "".join(f"  {p}\n" for p in llama_server_candidates())
+            + "  $PATH\n"
+            "Build it (cmake --build build -j --target llama-server) or pass "
+            "--llama-server PATH.")
 
     # keep expert_layers[0] on CUDA0, expert_layers[1] on CUDA1, spill the rest
     probe = []
@@ -687,21 +795,34 @@ def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lo
 class Gpu:
     index: int
     name: str
-    total_bytes: int
+    total_bytes: int          # memory.total -- the card's nameplate size
+    free_bytes: int           # memory.free  -- what a cudaMalloc can actually get
+    budget_bytes: int         # the basis planning uses (free, or total with --use-total-vram)
 
 
 def detect_gpus():
+    """
+    Read both memory.total and memory.free.
+
+    Planning against memory.total overstates what is actually allocatable, and
+    not only because a compositor or another process may hold VRAM: even on an
+    idle card nvidia-smi reports free well below total (464 MiB below on this
+    box's 5070 Ti, 384 MiB on the 4060) for driver-reserved memory that no
+    cudaMalloc will ever return. memory.free is what llama.cpp can actually get,
+    so it is the default basis; --use-total-vram reverts to the nameplate size.
+    """
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,name,memory.total",
+            ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=15, check=True).stdout
     except Exception as e:
         raise SystemExit(f"error: could not run nvidia-smi ({e}); pass --vram to override")
     gpus = []
     for line in out.strip().splitlines():
-        idx, name, total = [p.strip() for p in line.split(",")]
-        gpus.append(Gpu(int(idx), name, int(total) * MiB))
+        idx, name, total, free = [p.strip() for p in line.split(",")]
+        total, free = int(total) * MiB, int(free) * MiB
+        gpus.append(Gpu(int(idx), name, total, free, free))
     if not gpus:
         raise SystemExit("error: nvidia-smi reported no GPUs")
     return gpus
@@ -866,6 +987,481 @@ def render_ot(flags):
 
 
 # --------------------------------------------------------------------------
+# Dense models
+# --------------------------------------------------------------------------
+#
+# `-ot` moves *weights* off the hot card. That only pays when a large, rarely
+# touched slice of the weights exists -- i.e. per-layer expert sets. A dense
+# model has none: every tensor is read on every token, so relocating any of it
+# to CUDA1 or CPU costs throughput with nothing gained. The right tool is
+# llama.cpp's own layer split (`-ngl 99 -dev CUDA0,CUDA1`, no `-ts`), which
+# spreads weights AND the per-layer KV cache across both cards by free VRAM.
+#
+# So for a dense model this script stops being a tensor-override planner and
+# becomes a context-size calculator: given the weights and both cards' VRAM,
+# how much room is left for KV, and what -c does that buy at f16 vs q8_0?
+
+# The compute buffer of a dense two-card split
+# --------------------------------------------
+#
+# The MoE path's estimate_compute_buffer() has no n_ctx term at all -- it is a
+# function of (n_expert, n_moe_layers, n_ubatch) with a 1 GiB floor. For a dense
+# split that is the difference between a plan that loads and one that does not.
+# Measured here, llama.cpp b10277, Qwen3.8-27B Q4_K_M, -ub 512 -fa on, KV q8_0,
+# 4 server slots, both cards reporting the SAME size:
+#
+#   -c  32768 ( 32768 cells)   sched_reserve: CUDA0/CUDA1 = 377.13 MiB
+#   -c 100000 (100096 cells)   sched_reserve: CUDA0/CUDA1 = 903.13 MiB
+#
+# Two things fall out of that pair:
+#
+#  1. Both cards allocate the same buffer. A split graph reserves its scratch on
+#     every backend it touches, so CUDA1 does NOT get a fraction of CUDA0's the
+#     way it does in the MoE layout (--compute-buf1-frac). Charging CUDA1 35%
+#     of CUDA0 under-counts the small card by ~590 MiB at 100k, which is what
+#     the "cudaMalloc failed ... 903.13 MiB on device 1" report came down to.
+#
+#  2. The context-dependent half is the KQ mask, not a fitted slope:
+#         n_kv * n_ubatch * 4 bytes * n_seq_max
+#         100096 * 512 * 4 * 4 = 782.00 MiB   vs   903.13 - 121.13 = 782.00
+#          32768 * 512 * 4 * 4 = 256.00 MiB   vs   377.13 - 121.13 = 256.00
+#     Both points land exactly, so only the ub-sized activation scratch below is
+#     a constant, and it is the one thing --compute-buf overrides.
+DENSE_COMPUTE_BASE = 121 * MiB
+
+# The MTP draft context's own compute buffer, same treatment. Measured on
+# Qwen3.8-27B, -ub 512, --spec-type draft-mtp, on the card holding the nextn
+# block (CUDA1 here -- llama-server prints "[spec] adding 714.06 MiB to
+# fit_params_target for device CUDA1" and 0.00 for CUDA0):
+#
+#   -c 32768   sched_reserve: CUDA1 = 330.06 MiB
+#   -c 65536   sched_reserve: CUDA1 = 458.06 MiB
+#
+# The delta is again a mask, but a 2-byte one, matching this context's f16 KV:
+#     n_kv * n_ubatch * 2 * n_seq
+#     65536 * 512 * 2 * 4 = 256.00 MiB   vs   458.06 - 202.06 = 256.00
+#     32768 * 512 * 2 * 4 = 128.00 MiB   vs   330.06 - 202.06 = 128.00
+#
+# The 202 MiB base is one nextn block plus the shared head, so it is far more
+# arch-specific than the mask; MTP_COMPUTE_ESTIMATE stays the MoE fallback
+# (LongCat measured 115.01 MiB, a different graph entirely).
+MTP_COMPUTE_BASE = 202 * MiB
+
+
+def mtp_compute_buffer(info, n_ctx, n_ubatch, n_seq):
+    kv_size = int(math.ceil(n_ctx / 256.0) * 256)
+    return MTP_COMPUTE_BASE + kv_size * n_ubatch * 2 * max(n_seq, 1)
+
+
+def dense_compute_buffer(info, n_ctx, n_ubatch, n_seq, base=None):
+    """Per-card compute buffer for a dense layer split. Same size on every card."""
+    kv_size = int(math.ceil(n_ctx / 256.0) * 256)
+    mask = kv_size * n_ubatch * 4 * max(n_seq, 1) if info.main_kv_layers else 0
+    return (DENSE_COMPUTE_BASE if base is None else base) + mask
+
+
+def dense_weight_map(tensors, info):
+    """
+    Per-block weight bytes, plus the non-repeating tensors, placed the way
+    llama-model.cpp does it:
+
+      dev_input  = cpu_dev, unconditionally ("there is very little benefit to
+                   offloading the input layer, so always keep it on the CPU",
+                   llama-model.cpp:1377). token_embd.weight therefore costs no
+                   VRAM at all -- confirmed by the load log, which reports it as
+                   `CPU_Mapped model buffer size = 682.03 MiB` on Qwen3.8-27B.
+      dev_output = get_layer_buft_list(n_layer_all), i.e. the device that holds
+                   the LAST block. output.weight rides along with it.
+
+    Tied-embedding models have no output.weight; there token_embd is the output
+    projection, so it is charged to the output device instead of the CPU.
+    """
+    layer_bytes = {}
+    out_bytes = 0
+    cpu_bytes = 0
+    tied = not any(t.name == "output.weight" for t in tensors)
+    for t in tensors:
+        if t.layer is not None:
+            if t.layer in info.dead_layers:
+                continue
+            layer_bytes[t.layer] = layer_bytes.get(t.layer, 0) + t.nbytes
+        elif t.name == "token_embd.weight" and not tied:
+            cpu_bytes += t.nbytes
+        else:
+            out_bytes += t.nbytes
+    return layer_bytes, out_bytes, cpu_bytes
+
+
+# --- the layer split itself -------------------------------------------------
+#
+# llama-model.cpp normalises -ts into cumulative split points and then assigns
+#     layer_gpu(il) = upper_bound(splits, (il - i_gpu_start) / act_gpu_layers)
+# with act_gpu_layers = min(n_gpu_layers, n_layer_all + 1). With -ngl 99 and 65
+# blocks that denominator is 66, NOT 65, and the output layer is evaluated at
+# il = n_layer_all. Two boundaries verified against the load log's
+# "load_tensors: layer N assigned to device ..." lines on Qwen3.8-27B:
+#
+#   default (free-VRAM split, 15839:7804)  ->  blocks 0-44 on CUDA0
+#   -ts 49,15                              ->  blocks 0-50 on CUDA0
+#
+# so a requested boundary has to be turned back into a ratio, not guessed.
+
+def split_boundary(f0, n_layer_all, n_gpu_layers=99):
+    """How many leading blocks land on CUDA0 for a normalised split point f0."""
+    n_split = min(n_gpu_layers, n_layer_all + 1)
+    return sum(1 for il in range(n_layer_all + 1) if il / n_split < f0)
+
+
+def ts_for_boundary(boundary, n_layer_all, n_gpu_layers=99):
+    """
+    A -ts pair that reproduces `boundary` blocks on CUDA0. Aims at the midpoint
+    of the interval that maps to it, then verifies the round trip -- a rounded
+    ratio that lands on the wrong side of a block boundary would silently plan
+    for a layout llama.cpp will not build.
+    """
+    n_split = min(n_gpu_layers, n_layer_all + 1)
+    if boundary <= 0:
+        return (0.0, 1.0)
+    f0 = (boundary - 0.5) / n_split
+    for digits in (4, 6, 9):
+        ts0 = round(f0, digits)
+        ts1 = round(1.0 - f0, digits)
+        if ts0 > 0 and split_boundary(ts0 / (ts0 + ts1), n_layer_all, n_gpu_layers) == boundary:
+            return (ts0, ts1)
+    return (f0, 1.0 - f0)
+
+
+def fmt_ts(ts):
+    return "%s,%s" % tuple(("%.6f" % v).rstrip("0").rstrip(".") or "0" for v in ts)
+
+
+@dataclass
+class DenseFit:
+    boundary: int
+    ts: tuple
+    used: tuple                 # (CUDA0, CUDA1) bytes
+    budget: tuple
+    weights: tuple
+    kv: tuple
+    recr: tuple
+    compute: int                # per card, same on both
+    mtp: tuple
+    out_dev: int
+
+    @property
+    def slack(self):
+        return min(b - u for b, u in zip(self.budget, self.used))
+
+    def fits(self):
+        return self.slack >= 0
+
+
+def dense_fit(info, args, layer_bytes, out_bytes, budgets, n_ctx, kv_type,
+              boundary, compute_base, mtp_enabled):
+    """Price one candidate layer boundary across the two cards."""
+    kv_size = int(math.ceil(n_ctx / 256.0) * 256)
+    dev = lambda il: 0 if il < boundary else 1
+
+    weights = [0, 0]
+    for il, nb in layer_bytes.items():
+        weights[dev(il)] += nb
+    out_dev = dev(info.n_layer_all)
+    weights[out_dev] += out_bytes
+
+    kv = [0, 0]
+    for il in info.main_kv_layers:
+        d = dev(il)
+        kv[d] += row_size(kv_type, info.n_embd_k_gqa[il] * kv_size)
+        if info.n_embd_v_gqa[il]:
+            kv[d] += row_size(kv_type, info.n_embd_v_gqa[il] * kv_size)
+
+    n_rs_seq = rs_rollback_depth(info, args, mtp_enabled)
+    rs_per_layer = ((row_size(0, info.n_embd_r) + row_size(0, info.n_embd_s))
+                    * args.parallel * (1 + n_rs_seq))
+    recr = [0, 0]
+    for il in info.recr_layers:
+        recr[dev(il)] += rs_per_layer
+
+    compute = dense_compute_buffer(info, n_ctx, args.ubatch, args.parallel, compute_base)
+
+    mtp = [0, 0]
+    if mtp_enabled:
+        # The draft context's KV follows the blocks it caches, at f16, and its
+        # compute buffer lands on the card that holds those blocks -- not CUDA0.
+        # llama-server prints the split itself:
+        #   [spec] adding   0.00 MiB to fit_params_target for device CUDA0
+        #   [spec] adding 714.06 MiB to fit_params_target for device CUDA1
+        cached = (info.kv_layers[-info.n_nextn:]
+                  if info.arch in MTP_KV_FILTERED_ARCHS and info.n_nextn
+                  else info.kv_layers)
+        for il in cached:
+            d = dev(il)
+            mtp[d] += row_size(KV_TYPE_F16[1], info.n_embd_k_gqa[il] * kv_size)
+            if info.n_embd_v_gqa[il]:
+                mtp[d] += row_size(KV_TYPE_F16[1], info.n_embd_v_gqa[il] * kv_size)
+        mtp[dev(cached[-1]) if cached else 0] += mtp_compute_buffer(
+            info, n_ctx, args.ubatch, args.parallel)
+
+    used = tuple(weights[i] + kv[i] + recr[i] + compute + mtp[i] for i in (0, 1))
+    return DenseFit(boundary, ts_for_boundary(boundary, info.n_layer_all),
+                    used, tuple(budgets), tuple(weights), tuple(kv), tuple(recr),
+                    compute, tuple(mtp), out_dev)
+
+
+def plan_dense_split(info, args, layer_bytes, out_bytes, budgets, n_ctx, kv_type,
+                     compute_base, mtp_enabled):
+    """
+    Best layer boundary for this context, or None if no boundary fits.
+
+    "Best" is the one that maximises the SMALLER of the two cards' leftovers.
+    Pooling both cards into one budget -- which is what this script used to do --
+    hides the only failure that matters: llama.cpp fills the small card to the
+    brim while the big one still has gigabytes free, and the load dies on the
+    small card's compute buffer.
+    """
+    best = None
+    n_split = min(99, info.n_layer_all + 1)
+    for boundary in range(0, n_split + 1):
+        fit = dense_fit(info, args, layer_bytes, out_bytes, budgets, n_ctx, kv_type,
+                        boundary, compute_base, mtp_enabled)
+        if fit.fits() and (best is None or fit.slack > best.slack):
+            best = fit
+    return best
+
+
+def max_ctx_dense(info, args, layer_bytes, out_bytes, budgets, kv_type, compute_base,
+                  mtp_enabled, ctx_cap, granularity=1024):
+    """
+    Largest n_ctx some layer boundary can hold. Feasibility is monotone in n_ctx
+    (KV and the mask both only grow), so bisection is safe; the step function in
+    kv_cache padding is why this searches rather than divides.
+    """
+    def fits(n_ctx):
+        return plan_dense_split(info, args, layer_bytes, out_bytes, budgets, n_ctx,
+                                kv_type, compute_base, mtp_enabled) is not None
+
+    if not fits(granularity):
+        return 0, None
+    lo, hi = granularity, max(ctx_cap, granularity)
+    if fits(hi):
+        return hi, plan_dense_split(info, args, layer_bytes, out_bytes, budgets, hi,
+                                    kv_type, compute_base, mtp_enabled)
+    while lo < hi:
+        mid = (lo + hi + granularity) // 2
+        mid -= mid % granularity
+        if mid <= lo:
+            break
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - granularity
+    return lo, plan_dense_split(info, args, layer_bytes, out_bytes, budgets, lo,
+                                kv_type, compute_base, mtp_enabled)
+
+
+def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled):
+    """Print the VRAM budget and the context sizes a two-card layer split affords."""
+    e = sys.stderr.write
+
+    layer_bytes, out_bytes, cpu_weight_bytes = dense_weight_map(tensors, info)
+    gpu_weight_bytes = sum(layer_bytes.values()) + out_bytes
+    dead_bytes = sum(t.nbytes for t in tensors if t.layer in info.dead_layers)
+    compute_base = args.compute_buf * MiB if args.compute_buf is not None else None
+    compute_src = "given" if compute_base is not None else "derived"
+    budgets = [gpus[0].budget_bytes - args.reserve0 * MiB,
+               gpus[1].budget_bytes - args.reserve1 * MiB]
+
+    n_ctx_train = int(_mdget(md, info.arch, "context_length", 0) or 0)
+    ctx_cap = n_ctx_train or 1 << 20
+    n_live = info.n_layer_all - len(info.dead_layers)
+
+    variants = []      # (flag, kv name, kv type, max n_ctx, DenseFit)
+    for flag, (kv_name, kv_type) in (("", KV_TYPE_F16), ("-q8", KV_TYPE_Q8_0)):
+        ctx, fit = max_ctx_dense(info, args, layer_bytes, out_bytes, budgets, kv_type,
+                                 compute_base, mtp_enabled, ctx_cap)
+        variants.append((flag, kv_name, kv_type, ctx, fit))
+
+    if args.json:
+        print(json.dumps({
+            "model": os.path.basename(args.model),
+            "architecture": info.arch,
+            "dense": True,
+            "n_layer_all": info.n_layer_all,
+            "recurrent_layers": len(info.recr_layers),
+            "attention_layers": len(info.attn_layers),
+            "kv_layers": len(info.main_kv_layers),
+            "is_mla": info.is_mla,
+            "mtp_enabled": mtp_enabled,
+            "mtp_capable": info.mtp_capable,
+            "rs_rollback_depth": rs_rollback_depth(info, args, mtp_enabled),
+            "n_ctx_train": n_ctx_train,
+            "bytes": {
+                "weights_total": weights_bytes,
+                "weights_on_gpu": gpu_weight_bytes,
+                "weights_on_cpu": cpu_weight_bytes,
+                "dead_nextn": dead_bytes,
+                "budget_cuda0": budgets[0],
+                "budget_cuda1": budgets[1],
+            },
+            "max_ctx": {
+                kv_name: None if not ctx else {
+                    "n_ctx": ctx,
+                    "tensor_split": list(fit.ts),
+                    "blocks_on_cuda0": fit.boundary,
+                    "cuda0": {"used": fit.used[0], "budget": fit.budget[0],
+                              "weights": fit.weights[0], "kv": fit.kv[0],
+                              "recurrent": fit.recr[0], "compute": fit.compute},
+                    "cuda1": {"used": fit.used[1], "budget": fit.budget[1],
+                              "weights": fit.weights[1], "kv": fit.kv[1],
+                              "recurrent": fit.recr[1], "compute": fit.compute},
+                }
+                for _, kv_name, _, ctx, fit in variants},
+            "ot": [],
+        }, indent=2))
+        return
+
+    chosen = variants[1] if args.q8 else variants[0]
+
+    if args.flags_only:
+        print("# no tensor override applies -- dense model, use a plain layer split")
+        return
+
+    e(f"DENSE MODEL -- no tensor override applies\n\n")
+    e(f"Model         : {os.path.basename(args.model)}\n")
+    e(f"Architecture  : {info.arch}  ({info.name})\n")
+    e(f"Blocks        : {n_live} live -> {len(info.recr_layers)} recurrent (SSM/KDA), "
+      f"{len(info.attn_layers)} attention{' [MLA]' if info.is_mla else ''}"
+      f"; {len(info.main_kv_layers)} carry a KV cache\n")
+    e(f"Dense         : no *_exps.* tensors, so every weight is read on every token.\n"
+      f"                -ot would only move hot weights to a slower card. Let\n"
+      f"                llama.cpp split by layer across CUDA0+CUDA1 instead; this\n"
+      f"                report sizes that split card by card.\n")
+    if mtp_enabled:
+        dup = "a full duplicate" if info.arch not in MTP_KV_FILTERED_ARCHS \
+            else f"{info.n_nextn} nextn layer(s)"
+        n_rs_seq = rs_rollback_depth(info, args, mtp_enabled)
+        e(f"MTP           : ENABLED -- {info.n_nextn} nextn block(s) present, so the commands\n"
+          f"                carry --spec-type draft-mtp. Priced into the -c figures below:\n"
+          f"                the nextn block's weights, a second llama_context (KV over\n"
+          f"                {dup}, at f16 whatever -ctk says, plus its own\n"
+          f"                compute buffer)")
+        if n_rs_seq:
+            e(f",\n                and {1 + n_rs_seq}x the recurrent state, because n_rs_seq="
+              f"{n_rs_seq} (--draft-max)\n"
+              f"                keeps a rollback copy per drafted token")
+        e(f".\n                Use --no-mtp to reclaim all of it.\n")
+    elif info.mtp_capable:
+        e(f"MTP           : available ({info.n_nextn} nextn block(s)) but disabled by --no-mtp;\n"
+          f"                dropping it is already reflected in the budget below\n")
+    elif info.n_nextn:
+        e(f"MTP           : declared ({info.n_nextn} block(s)) but the nextn tensors are absent\n")
+    if n_ctx_train:
+        e(f"Trained ctx   : {n_ctx_train:,}  (the -c figures below are capped here)\n")
+    e("\n")
+
+    basis = "memory.total" if args.use_total_vram else "memory.free"
+    e("Per-card budget (llama.cpp splits layers, so each card is a separate limit)\n")
+    for i, g in enumerate(gpus[:2]):
+        short = g.name.replace("NVIDIA GeForce ", "")
+        reserve = (args.reserve0 if i == 0 else args.reserve1) * MiB
+        e(f"  CUDA{g.index} ({short})\n")
+        e(f"    {basis:<28}".ljust(38) + f"{fmt_mib(g.budget_bytes):>12}\n")
+        if not args.use_total_vram and g.total_bytes > g.free_bytes:
+            e(f"      ({fmt_mib(g.total_bytes)} total, "
+              f"{fmt_mib(g.total_bytes - g.free_bytes)} already held)\n")
+        e("    - reserved (CUDA ctx + headroom)".ljust(38) + f"{fmt_mib(reserve):>12}\n")
+        e("    = budget".ljust(38) + f"{fmt_mib(budgets[i]):>12}\n")
+    e("\n")
+    e("Weights\n")
+    e("  on GPU (blocks + output)".ljust(38) + f"{fmt_gib(gpu_weight_bytes):>12}\n")
+    if cpu_weight_bytes:
+        e("  token_embd, always CPU-resident".ljust(38) + f"{fmt_mib(cpu_weight_bytes):>12}\n")
+    if dead_bytes:
+        e(f"  {len(info.dead_layers)} nextn block(s), not loaded".ljust(38)
+          + f"{fmt_mib(dead_bytes):>12}\n")
+    e("\n")
+
+    if not any(ctx for _, _, _, ctx, _ in variants):
+        e(f"No context fits. {fmt_gib(gpu_weight_bytes)} of weights against "
+          f"{fmt_mib(sum(budgets))} of budget\n"
+          f"leaves no room -- use a smaller quant, or drop -ngl below {n_live}.\n")
+        raise SystemExit(2)
+
+    for flag, kv_name, kv_type, ctx, fit in variants:
+        if not ctx:
+            e(f"KV {kv_name}: does not fit\n\n")
+            continue
+        capped = "  (capped at trained ctx)" if n_ctx_train and ctx >= n_ctx_train else ""
+        mark = "  <- selected" if (flag == "-q8") == bool(args.q8) else ""
+        e(f"KV {kv_name}  ->  -c {ctx}   -ts {fmt_ts(fit.ts)}{capped}{mark}\n")
+        e(f"  blocks 0-{fit.boundary - 1} on CUDA0, {fit.boundary}-{info.n_layer_all - 1} "
+          f"on CUDA1; output.weight on CUDA{fit.out_dev}\n")
+        e(f"  {'':22s}{'CUDA0':>12}{'CUDA1':>12}\n")
+        rows = [("weights", fit.weights),
+                (f"KV cache ({kv_name})", fit.kv),
+                (f"recurrent state ({args.parallel} seq)", fit.recr),
+                (f"compute buffer ({compute_src})", (fit.compute, fit.compute))]
+        if mtp_enabled:
+            rows.append(("MTP draft context", fit.mtp))
+        for label, pair in rows:
+            if not any(pair):
+                continue
+            e(f"  {label:<22}{fmt_mib(pair[0]):>12}{fmt_mib(pair[1]):>12}\n")
+        e(f"  {'-' * 46}\n")
+        e(f"  {'used':<22}{fmt_mib(fit.used[0]):>12}{fmt_mib(fit.used[1]):>12}\n")
+        e(f"  {'of budget':<22}{fmt_mib(fit.budget[0]):>12}{fmt_mib(fit.budget[1]):>12}\n")
+        e(f"  {'left over':<22}{fmt_mib(fit.budget[0] - fit.used[0]):>12}"
+          f"{fmt_mib(fit.budget[1] - fit.used[1]):>12}\n")
+        e("\n")
+        for line in dense_command(args, ctx, flag == "-q8", mtp_enabled, fit).split("\n"):
+            e(f"  {line}\n")
+        e("\n")
+
+    # What MTP is actually costing, in tokens of context, for the selected KV type.
+    if mtp_enabled and chosen[3]:
+        info_off = analyse(md, tensors, use_mtp=False)
+        lb_off, ob_off, _ = dense_weight_map(tensors, info_off)
+        ctx_off, _ = max_ctx_dense(info_off, args, lb_off, ob_off, budgets, chosen[2],
+                                   compute_base, False, ctx_cap)
+        if ctx_off > chosen[3]:
+            e(f"MTP is costing {ctx_off - chosen[3]:,} tokens of context: --no-mtp would take\n"
+              f"KV {chosen[1]} from -c {chosen[3]} to -c {ctx_off}. Whether the drafting pays for\n"
+              f"that is a throughput question this script cannot answer -- benchmark both.\n\n")
+
+    if compute_src == "derived":
+        e("The compute-buffer figure is n_kv*n_ubatch*4*n_seq of KQ mask plus "
+          f"{fmt_mib(DENSE_COMPUTE_BASE)} of\n"
+          "activation scratch, matched to two measured points on this box. If a load\n"
+          "still OOMs, read the real 'compute buffer size' out of llama-server -lv 5\n"
+          "and pass its ub-only part via --compute-buf.\n")
+    e("Without -ts, llama.cpp splits by free VRAM at load time, which overfills the\n"
+      "smaller card: the same weights at -c 100000 leave the 4060 with 197 MiB free\n"
+      "and the 5070 Ti with 2659 MiB. The -ts above is what balances them, so keep it.\n\n")
+
+    # stdout carries the single runnable command for the KV type actually
+    # selected on the command line, so `... 2>/dev/null | sh` still works.
+    if chosen[3]:
+        print(dense_command(args, chosen[3], args.q8, mtp_enabled, chosen[4]))
+    else:
+        fallback = variants[1]
+        print(dense_command(args, fallback[3], True, mtp_enabled, fallback[4]))
+
+
+def dense_command(args, n_ctx, q8, mtp_enabled, fit=None):
+    """The llama-server invocation for a dense two-card layer split."""
+    parts = [f"{args.server_bin} -m {args.model}", "-ngl 99", "-dev CUDA0,CUDA1"]
+    if fit is not None:
+        parts.append(f"-ts {fmt_ts(fit.ts)}")
+    parts += [f"-c {n_ctx}", f"-ub {args.ubatch}"]
+    if q8:
+        parts += ["-ctk q8_0", "-ctv q8_0"]
+    if mtp_enabled:
+        parts += ["--spec-type draft-mtp"]
+    parts += ["-fa on"]
+    return " \\\n  ".join(parts)
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
@@ -886,6 +1482,11 @@ def main():
                     help="do NOT use the model's MTP/nextn blocks. By default, if the GGUF ships "
                          "nextn tensors the plan budgets for them and the command carries "
                          "--spec-type draft-mtp.")
+    ap.add_argument("--draft-max", type=int, default=3,
+                    help="llama.cpp's --draft-max, i.e. how many tokens MTP drafts per step "
+                         "(default 3, matching common_params_speculative_draft::n_max). On a "
+                         "recurrent arch this is also cparams.n_rs_seq, so the recurrent state "
+                         "is sized for 1+N copies -- +1795 MiB on Qwen3.8-27B at the default.")
     ap.add_argument("--server-bin", default="./llama-server",
                     help="how the emitted command invokes llama-server (default ./llama-server)")
     ap.add_argument("--reserve0", type=int, default=1024,
@@ -899,21 +1500,32 @@ def main():
                          "(default 512; the context itself measures ~104 MiB)")
     ap.add_argument("--compute-buf1-frac", type=float, default=0.35,
                     help="CUDA1's compute buffer as a fraction of CUDA0's (default 0.35; "
-                         "measured 328.06 vs 1022.02 MiB on Ling at -ub 2048)")
+                         "measured 328.06 vs 1022.02 MiB on Ling at -ub 2048). MoE layouts "
+                         "only -- in a dense layer split both cards allocate the same size, "
+                         "so this is ignored there.")
     ap.add_argument("--measure", action="store_true",
                     help="load the model once with -cmoe and read the REAL compute buffer sizes "
                          "from llama.cpp instead of estimating. Strongly recommended: the "
                          "estimate does not generalise across architectures.")
     ap.add_argument("--llama-server", default=None,
-                    help="path to llama-server for --measure (default: PATH, then ~/Workplace/llama.cpp*/build/bin)")
+                    help="path to llama-server for --measure. Default: the checkout next to "
+                         "this script (../llama.cpp/build/bin), then ../llama.cpp*, then "
+                         "~/Workplace/llama.cpp*, then $PATH.")
     ap.add_argument("--measure-port", type=int, default=18099, help="port used by --measure")
     ap.add_argument("--measure-timeout", type=int, default=600,
                     help="seconds to wait for --measure (default 600)")
     ap.add_argument("--compute-buf", type=int, default=None,
                     help="MiB for the CUDA0 compute buffer; overrides estimate and --measure. "
-                         "Read the real value from llama-server -lv 5 'compute buffer size'.")
+                         "Read the real value from llama-server -lv 5 'compute buffer size'. "
+                         "For a dense model this sets only the ub-sized activation scratch; "
+                         "the KQ-mask term still scales with -c on top of it.")
     ap.add_argument("--vram", default=None,
-                    help="override detected VRAM, MiB, comma-separated per device, e.g. 16303,8188")
+                    help="override detected VRAM, MiB, comma-separated per device, e.g. 15839,7804")
+    ap.add_argument("--use-total-vram", action="store_true",
+                    help="plan against nvidia-smi memory.total instead of memory.free "
+                         "(default). Use only when the cards will be idle at load time; "
+                         "free is lower than total even on an idle card because of "
+                         "driver-reserved memory, and planning past it OOMs.")
     ap.add_argument("--flags-only", action="store_true", help="print only the -ot flags")
     ap.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = ap.parse_args()
@@ -928,10 +1540,13 @@ def main():
     mtp_enabled = args.mtp and info.mtp_capable
 
     gpus = detect_gpus()
+    if args.use_total_vram:
+        for g in gpus:
+            g.budget_bytes = g.total_bytes
     if args.vram:
         overrides = [int(x) * MiB for x in args.vram.split(",")]
         for g, v in zip(gpus, overrides):
-            g.total_bytes = v
+            g.total_bytes = g.free_bytes = g.budget_bytes = v
     if len(gpus) < 2:
         raise SystemExit(f"error: this script assumes 2 GPUs, found {len(gpus)}")
 
@@ -958,6 +1573,16 @@ def main():
     total_expert_bytes = sum(expert_bytes.values())
     weights_bytes = core_bytes + sum(lookup_bytes.values()) + total_expert_bytes
 
+    # A dense model has no `*_exps.*` tensors, so every weight is a core tensor
+    # that rule 1 pins to CUDA0. There is nothing this script is allowed to move
+    # to CUDA1, and pack() would bail out at `used0 > gpu0_budget` and print a
+    # "cannot fit on CUDA0" report that reads as a context/KV problem when the
+    # real answer is "wrong tool: use a plain layer split". Report on that split
+    # instead -- it is the only sensible way to run a dense model on two cards.
+    if not expert_layers:
+        dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled)
+        return
+
     # A model with tied embeddings reuses token_embd as the output projection;
     # evicting it would put a full vocab matmul on the CPU every token. Resolve
     # this before measuring, so the probe uses the same placement as the plan.
@@ -967,10 +1592,11 @@ def main():
 
     kv_name, kv_type = KV_TYPE_Q8_0 if args.q8 else KV_TYPE_F16
     kv_bytes = kv_cache_bytes(info, args.ctx, kv_type)
-    recr_bytes = recurrent_state_bytes(info, args.parallel)
+    recr_bytes = recurrent_state_bytes(info, args.parallel,
+                                       rs_rollback_depth(info, args, mtp_enabled))
     # --spec-type draft-mtp builds a SECOND llama_context on the same model, with
     # its own KV cache (usually a full duplicate) and its own compute buffer.
-    mtp_kv_bytes = mtp_kv_cache_bytes(info, args.ctx, kv_type) if mtp_enabled else 0
+    mtp_kv_bytes = mtp_kv_cache_bytes(info, args.ctx) if mtp_enabled else 0
     measured, measured_mtp = {}, {}
     if args.compute_buf is not None:
         compute_bytes = args.compute_buf * MiB
@@ -992,8 +1618,8 @@ def main():
     else:
         mtp_compute_bytes = MTP_COMPUTE_ESTIMATE
 
-    gpu0_budget = gpus[0].total_bytes - args.reserve0 * MiB
-    gpu1_budget = gpus[1].total_bytes - args.reserve1 * MiB
+    gpu0_budget = gpus[0].budget_bytes - args.reserve0 * MiB
+    gpu1_budget = gpus[1].budget_bytes - args.reserve1 * MiB
     fixed0 = kv_bytes + recr_bytes + compute_bytes + mtp_kv_bytes + mtp_compute_bytes
     # CUDA1 holds only expert weights, but it still takes part in the graph and
     # so allocates its own compute buffer. Measured 328.06 MiB (Ling) and
@@ -1153,7 +1779,11 @@ def main():
             (gpus[1], gpu1_budget, plan.gpu1_used))):
         reserve = args.reserve0 if i == 0 else args.reserve1
         e(f"  CUDA{i} ({gpu.name})\n")
-        e(f"    total VRAM                   {fmt_mib(gpu.total_bytes):>12}\n")
+        basis = "memory.total" if args.use_total_vram else "memory.free"
+        e(f"    {basis:<24}     {fmt_mib(gpu.budget_bytes):>12}\n")
+        if not args.use_total_vram and gpu.total_bytes > gpu.free_bytes:
+            e(f"      ({fmt_mib(gpu.total_bytes)} total, "
+              f"{fmt_mib(gpu.total_bytes - gpu.free_bytes)} already held)\n")
         e(f"    - reserved (CUDA ctx)        {fmt_mib(reserve * MiB):>12}\n")
         e(f"    = budget                     {fmt_mib(budget):>12}\n")
         lk_here = ([n for n in lookup_bytes

@@ -12,6 +12,6 @@ cd ~/Workplace/llama.cpp-ling-flash/build/bin/
   -ot 'blk\.(23|24|25|26|27|28|29|30|31|32|33|34|35|36|37)\.(ffn_down_exps\.weight|ffn_gate_exps\.weight|ffn_up_exps\.weight)$=CUDA1,^token_embd\.weight$=CUDA1,blk\.(38|39)\.(ffn_down_exps\.weight|ffn_gate_exps\.weight|ffn_up_exps\.weight)$=CPU' \
   -fa on \
   --temp 0.7 --top-p 0.95 --top-k 20 --no-ui \
-  --port 1234
+  --host 0.0.0.0 --port 1234
 
 cd ~/Workplace/llama-cli

@@ -14,6 +14,6 @@ cd ~/Workplace/llama.cpp-longcat-flash/build/bin/
   --temp 0.7 --top-p 0.95 --top-k 40 --repeat-penalty 1.06 \
   --jinja --chat-template-file ~/Workplace/llama-cli/longcat-lite.jinja \
   -rea off \
-  --port 1234
+  --host 0.0.0.0 --port 1234
 
 cd ~/Workplace/llama-cli
