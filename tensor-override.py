@@ -28,6 +28,16 @@ card SEPARATELY (weights + its share of the KV cache + its share of the
 recurrent state + its own full compute buffer), and reports the largest `-c`
 that fits together with the `-ts` that balances the two cards. See dense_report().
 
+Every model, dense or MoE, ALSO gets a `-sm tensor` plan (tensor parallelism).
+That is usually the faster way to run two cards, because the cards work
+concurrently instead of taking turns, and it makes `-ts` a speed knob with a
+closed-form optimum -- ts_i = BW_i / sum(BW), read out of gpu-bandwidth.json.
+See the block above tensor_weight_map(). Pass --no-tensor-split to skip it.
+
+`-c` is optional. GIVEN, the plan targets exactly that context and pushes
+leading blocks into RAM (via `-ngl`) if VRAM cannot hold it. OMITTED, the
+plan reports the largest context that still keeps every block on the GPU.
+
 Pricing the two cards as one pooled budget -- which this script used to do --
 is the trap: llama.cpp fills the small card first, so a plan that looks like it
 has gigabytes spare can still die on the small card's compute buffer. And that
@@ -36,6 +46,8 @@ KQ mask, so it grows with `-c` on BOTH cards. See DENSE_COMPUTE_BASE.
 
 Usage:
     ./tensor-override.py MODEL.gguf [-q8] [-c CTX] [options]
+    ./tensor-override.py MODEL.gguf -q8            # best-fit context
+    ./tensor-override.py MODEL.gguf -q8 -c 65535   # spill to RAM if need be
 """
 
 import argparse
@@ -53,6 +65,11 @@ from dataclasses import dataclass, field
 
 MiB = 1024 * 1024
 GiB = 1024 * 1024 * 1024
+
+# The -ot planner packs experts against a FIXED context, so it needs a target
+# even when -c is omitted. The -sm tensor planner does not: with no -c it
+# searches for the largest context that fits.
+DEFAULT_MOE_CTX = 65535
 
 GGUF_MAGIC = 0x46554747
 
@@ -426,14 +443,34 @@ def analyse(md, tensors, use_mtp=False):
     key_len = int(_mdget(md, arch, "attention.key_length", default_head_dim) or default_head_dim)
     val_len = int(_mdget(md, arch, "attention.value_length", default_head_dim) or default_head_dim)
 
+    # attention.key_length / value_length are SCALARS in the GGUF, but the head
+    # dim is not always uniform across blocks. gemma-4-31B declares
+    # key_length = 512 while only its 10 GLOBAL blocks are 4 heads x 512; the 50
+    # SWA blocks are 16 heads x 256. Trusting the scalar there doubles the KV of
+    # every SWA layer -- on this box that alone reported a -c 13312 ceiling for a
+    # model that actually runs at -c 32768.
+    #
+    # The projection shapes are ground truth and need no per-arch rule:
+    # blk.N.attn_k.weight is (n_embd, n_embd_k_gqa), so read the width off the
+    # tensor and keep the metadata only as the fallback for layers that have no
+    # such tensor (MLA, and anything that fuses QKV).
+    k_width, v_width = {}, {}
+    for t in tensors:
+        if t.layer is None or len(t.shape) < 2:
+            continue
+        if t.name.endswith(".attn_k.weight"):
+            k_width[t.layer] = t.shape[1]
+        elif t.name.endswith(".attn_v.weight"):
+            v_width[t.layer] = t.shape[1]
+
     n_embd_k_gqa, n_embd_v_gqa = {}, {}
     for il in kv_layers:
         n_kv_head = int(head_count_kv[il]) if il < len(head_count_kv) else 0
         if n_kv_head == 0:
             n_kv_head = 1
-        n_embd_k_gqa[il] = key_len * n_kv_head
+        n_embd_k_gqa[il] = k_width.get(il, key_len * n_kv_head)
         # Under MLA llama.cpp allocates K only (has_v = !is_mla).
-        n_embd_v_gqa[il] = 0 if is_mla else val_len * n_kv_head
+        n_embd_v_gqa[il] = 0 if is_mla else v_width.get(il, val_len * n_kv_head)
 
     # --- recurrent state widths, mirroring n_embd_r() / n_embd_s() -----------
     n_embd_r = n_embd_s = 0
@@ -973,6 +1010,7 @@ class Gpu:
     total_bytes: int          # memory.total -- the card's nameplate size
     free_bytes: int           # memory.free  -- what a cudaMalloc can actually get
     budget_bytes: int         # the basis planning uses (free, or total with --use-total-vram)
+    bw: float = 0.0           # memory bandwidth, GB/s -- from gpu-bandwidth.json or --bw
 
 
 def detect_gpus():
@@ -1433,7 +1471,562 @@ def max_ctx_dense(info, args, layer_bytes, out_bytes, budgets, kv_type, compute_
                                 kv_type, compute_base, mtp_enabled)
 
 
-def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled):
+# --------------------------------------------------------------------------
+# -sm tensor -- tensor parallelism across both cards
+# --------------------------------------------------------------------------
+#
+# -sm layer is a PIPELINE: llama.cpp gives each block to ONE card, so a token
+# costs bytes0/BW0 + bytes1/BW1. The cards take turns and a slow card is paid
+# for in full -- on a 5070 Ti + 4060 the 4060 ate ~60% of every token's time
+# for ~33% of the weights. -sm tensor instead wraps both cards in a single
+# "Meta" device (llama.cpp:157-183) and slices every eligible tensor across
+# them, so they run CONCURRENTLY and a token costs max(bytes0/BW0, bytes1/BW1).
+#
+# That max() is what turns -ts from a VRAM knob into a SPEED knob. The time is
+# minimised when both cards finish together:
+#
+#     bytes_i = ts_i * P            (P = the pool that -ts slices)
+#     bytes0/BW0 = bytes1/BW1   =>  ts_i = BW_i / sum(BW)
+#
+# and, crucially, that optimum does NOT depend on P -- weights, KV cache and
+# recurrent state are all sliced by the same -ts, so they all scale together.
+# Measured on gemma-4-31B Q4_K_M (llama-bench tg128, 5070 Ti + 4060, b10566):
+#
+#     -sm layer  -ts 0.68,0.32   23.9 t/s
+#     -sm layer  -ts 0.86,0.14   30.1 t/s
+#     -sm tensor -ts 0.68,0.32   32.3 t/s
+#     -sm tensor -ts 0.72,0.28   35.5 t/s
+#     -sm tensor -ts 0.78,0.22   41.0 t/s   <- 896/(896+272) = 0.767, so the
+#     -sm tensor -ts 0.86,0.14   39.2 t/s      calculated optimum is within 2%
+#
+# -sm row is a different thing and is no longer available on CUDA at all: the
+# CUDA backend stopped exporting ggml_backend_split_buffer_type (only SYCL
+# still does), so llama-model.cpp:1005 throws
+#     "device CUDA0 does not support split buffers".
+
+# What the Meta device actually slices. Ported verbatim from the regex list in
+# llama_meta_device_get_split_state (llama-model.cpp:365-399); llama.cpp uses
+# std::regex_match, i.e. the whole name must match, hence the anchors.
+#
+# A tensor that matches is cut along an axis and each card keeps its slice. A
+# tensor that does NOT match is MIRRORED -- ggml-backend-meta.cpp keeps a FULL
+# COPY on every card (GGML_BACKEND_SPLIT_AXIS_MIRRORED), so it is charged to
+# BOTH budgets instead of being divided between them. Norms are tiny, but a
+# tied token_embd used as the output projection is not: on gemma-4-31B that is
+# 756 MiB on each card, and leaving it out of the mirrored bucket under-counts
+# CUDA1 by exactly that much.
+TENSOR_SPLIT_RES = tuple(re.compile(p + r"\Z") for p in (
+    r"blk\.\d*\.attn_q.weight",
+    r"blk\.\d*\.attn_(k|v).weight",
+    r"blk\.\d*\.attn_qkv.weight",
+    r"blk\.\d*\.attn_q\.bias",
+    r"blk\.\d*\.attn_(k|v)\.bias",
+    r"blk\.\d*\.attn_qkv.bias",
+    r"blk\.\d*\.attn_(q|k)_norm\.weight",
+    r"blk\.\d*\.attn_sinks.weight",
+    r"blk\.\d*\.attn_output.weight",
+    r"blk\.\d*\.attn_output.bias",
+    r"blk\.\d*\.attn_gate.weight",
+    r"blk\.\d*\.ssm_dt.bias",
+    r"blk\.\d*\.ssm_a",
+    r"blk\.\d*\.ssm_alpha.weight",
+    r"blk\.\d*\.ssm_beta.weight",
+    r"blk\.\d*\.ssm_ba.weight",
+    r"blk\.\d*\.ssm_conv1d.weight",
+    r"blk\.\d*\.ssm_out.weight",
+    r"blk\.\d*\.ffn_up(_exps)?.weight",
+    r"blk\.\d*\.ffn_up(_exps)?.bias",
+    r"blk\.\d*\.ffn_gate(_exps)?.weight",
+    r"blk\.\d*\.ffn_gate(_exps)?.bias",
+    r"blk\.\d*\.ffn_gate_up(_exps)?.weight",
+    r"blk\.\d*\.ffn_down(_exps)?.weight",
+    r"blk\.\d*\.ffn_down.bias",
+    r"blk\.\d*\.ffn_down_exps.bias",
+    r"output\.weight",
+    r"output\.bias",
+))
+
+
+def is_split_tensor(name):
+    """True if -sm tensor slices this tensor; False if every card gets a copy."""
+    return any(r.match(name) for r in TENSOR_SPLIT_RES)
+
+
+# Fraction of nominal bandwidth actually reached during token generation.
+#
+# Both were backed out of measurements on this box (gemma-4-31B Q4_K_M, 60
+# blocks, 17.05 GiB of weights, 5070 Ti @ 896 GB/s + 4060 @ 272 GB/s):
+#
+#   layer split, -ts 0.68  ->  11594 MiB/896 + 5866 MiB/272 = 36.2 ms = 27.6 t/s
+#                              measured 23.9 t/s             => 0.86
+#   tensor split, 5 points ->  0.65 .. 0.69 across -ts 0.68 .. 0.86, flat
+#
+# Tensor parallelism is the LESS efficient of the two per byte -- it pays for an
+# AllReduce on every layer -- and still wins by a wide margin, because max()
+# beats sum(). The gap should narrow with a build that has NCCL: llama.cpp
+# prints "NCCL not compiled in; falling back to internal AllReduce. Recompile
+# with -DGGML_CUDA_NCCL=ON" on this box, so 0.67 is the no-NCCL figure.
+MBU_LAYER  = 0.86
+MBU_TENSOR = 0.67
+
+TENSOR_SCRATCH_PER_UB = int(0.233 * MiB)   # measured; see tensor_compute_buffer
+BANDWIDTH_FILE = "gpu-bandwidth.json"
+DEFAULT_CPU_BW = 50.0    # GB/s, only used to price blocks that spill into RAM
+
+
+def load_bandwidth_table(path=None):
+    """
+    -> (name -> GB/s, system RAM GB/s, path of the file it came from).
+
+    Lives in gpu-bandwidth.json next to this script so it can be edited without
+    touching code; keys beginning with "_" are notes and settings, not cards.
+    """
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                BANDWIDTH_FILE)
+    if not os.path.exists(path):
+        return {}, DEFAULT_CPU_BW, path
+    try:
+        with open(path) as fh:
+            raw = json.load(fh)
+    except ValueError as exc:
+        raise SystemExit(f"error: {path} is not valid JSON ({exc})")
+    cards = {k: v for k, v in raw.items() if not k.startswith("_")}
+    return cards, float(raw.get("_cpu_gb_s", DEFAULT_CPU_BW)), path
+
+
+def bandwidth_for(name, table):
+    """
+    Look a card up: exact, then case-insensitive, then the longest substring
+    match. None when it is not listed -- the caller turns that into an
+    actionable error rather than guessing, because only the RATIO between the
+    cards matters and a wrong one silently moves -ts to the wrong place.
+    """
+    if name in table:
+        return float(table[name])
+    lowered = {k.lower(): v for k, v in table.items()}
+    if name.lower() in lowered:
+        return float(lowered[name.lower()])
+    hits = [k for k in table if k.lower() in name.lower() or name.lower() in k.lower()]
+    if hits:
+        return float(table[max(hits, key=len)])
+    return None
+
+
+def resolve_bandwidths(args, gpus):
+    """Attach .bw to every GPU from --bw or gpu-bandwidth.json; -> CPU GB/s."""
+    table, cpu_bw, path = load_bandwidth_table(args.bandwidth_file)
+    if args.cpu_bw:
+        cpu_bw = float(args.cpu_bw)
+    if args.bw:
+        vals = [float(x) for x in args.bw.replace("/", ",").split(",")]
+        if len(vals) < len(gpus):
+            raise SystemExit(f"error: --bw needs {len(gpus)} values, got {len(vals)}")
+        for g, v in zip(gpus, vals):
+            g.bw = v
+        return cpu_bw
+    missing = []
+    for g in gpus:
+        g.bw = bandwidth_for(g.name, table)
+        if g.bw is None:
+            missing.append(g.name)
+    if missing:
+        names = sorted(set(missing))
+        raise SystemExit(
+            "error: no memory bandwidth on file for: " + ", ".join(names)
+            + f"\n       add it to {path}, e.g.\n"
+            + "".join(f'           "{n}": 448,\n' for n in names)
+            + "       (GB/s, from the card's spec sheet), or pass --bw "
+            + ",".join("448" for _ in gpus) + "\n")
+    return cpu_bw
+
+
+def tensor_compute_buffer(info, args, n_ctx, base=None):
+    """
+    Compute buffer under -sm tensor. MIRRORED: both cards allocate the same
+    size, so this is charged to each budget, not divided between them.
+
+    Measured on gemma-4-31B Q4_K_M, -np 1, q8_0 KV (llama-server -lv 5,
+    "Meta() compute buffer size"):
+
+        -c 32768 -ub  256    316.42 MiB
+        -c 32768 -ub  512    375.80 MiB
+        -c 32768 -ub 1024    495.32 MiB
+        -c  8192 -ub  512    189.80 MiB
+
+    Two terms fall straight out of those. Holding -ub and varying -c gives
+    186.00 MiB over 24576 extra cells, i.e. ~8 KiB per cell -- that is the KQ
+    mask at n_batch (-b, default 2048) x 4 bytes, NOT n_ubatch, which is where
+    the layer-split estimator above differs. An iSWA model allocates one mask
+    per cache, so the cell count is the non-SWA and SWA caches added together.
+    Holding -c and varying -ub gives a clean 0.233 MiB per ubatch token of
+    activation scratch on top.
+
+    The fit runs ~11 MiB HIGH on every measured point, which is the direction
+    to be wrong in. All five points are -np 1; --compute-buf overrides the whole
+    thing if a load still disagrees.
+    """
+    if base is not None:
+        return base + TENSOR_SCRATCH_PER_UB * args.ubatch
+    base_cells, swa_cells, _ = kv_cell_counts(info, n_ctx, args.parallel, args.ubatch,
+                                              args.kv_unified, args.swa_full)
+    swa = set(info.swa_layers)
+    cells = base_cells + (swa_cells if swa else 0)
+    n_batch = max(args.batch, args.ubatch)
+    mask = cells * n_batch * 4 if info.main_kv_layers else 0
+    return mask + TENSOR_SCRATCH_PER_UB * args.ubatch
+
+
+def tensor_weight_map(tensors, info):
+    """
+    Per-block weight bytes under -sm tensor, split into the part -ts slices and
+    the part every card gets a full copy of.
+
+    token_embd is charged twice on purpose. dev_input is unconditionally the CPU
+    (llama-model.cpp:1377), so it always costs a CPU_Mapped buffer; and on a
+    tied-embedding model it is ALSO the output projection, which the split regex
+    list does not match (only a literal "output.weight" does), so a full copy
+    lands on every card as well. Both halves were confirmed against the load log
+    on gemma-4-31B, which prints
+        CPU_Mapped model buffer size =   756.00 MiB
+        Meta()     model buffer size = 13285.19 MiB
+    and 0.75*16698.70 + 4.94 + 756.00 = 13284.97.
+    """
+    split_layer, mirror_layer = {}, {}
+    split_other = mirror_other = cpu_bytes = 0
+    tied = not any(t.name == "output.weight" for t in tensors)
+    for t in tensors:
+        if t.layer is not None and t.layer in info.dead_layers:
+            continue
+        if t.name == "token_embd.weight":
+            cpu_bytes += t.nbytes
+            if tied:
+                mirror_other += t.nbytes
+            continue
+        if t.layer is not None:
+            d = split_layer if is_split_tensor(t.name) else mirror_layer
+            d[t.layer] = d.get(t.layer, 0) + t.nbytes
+        elif is_split_tensor(t.name):
+            split_other += t.nbytes
+        else:
+            mirror_other += t.nbytes
+    return split_layer, mirror_layer, split_other, mirror_other, cpu_bytes
+
+
+def active_fraction(name, info):
+    """
+    Share of a tensor read per generated token. Dense weights are read whole;
+    only n_expert_used of n_expert experts are touched, so an MoE's expert
+    tensors are read in proportion. Bandwidth, not capacity -- this is used for
+    the t/s estimate only, never for the VRAM budget.
+    """
+    if "_exps." in name and info.n_expert:
+        return max(info.n_expert_used, 1) / float(info.n_expert)
+    return 1.0
+
+
+def tensor_active_map(tensors, info):
+    """(sliced, mirrored) bytes READ PER TOKEN, per block, for the t/s estimate."""
+    split_layer, mirror_layer = {}, {}
+    split_other = mirror_other = 0
+    tied = not any(t.name == "output.weight" for t in tensors)
+    for t in tensors:
+        if t.layer is not None and t.layer in info.dead_layers:
+            continue
+        nb = t.nbytes * active_fraction(t.name, info)
+        if t.name == "token_embd.weight":
+            if tied:
+                mirror_other += nb
+            continue
+        if t.layer is not None:
+            d = split_layer if is_split_tensor(t.name) else mirror_layer
+            d[t.layer] = d.get(t.layer, 0) + nb
+        elif is_split_tensor(t.name):
+            split_other += nb
+        else:
+            mirror_other += nb
+    return split_layer, mirror_layer, split_other, mirror_other
+
+
+@dataclass
+class TensorFit:
+    ts: tuple                   # (ts0, ts1), what to pass to -ts
+    ts_ideal: float             # BW0/(BW0+BW1), before VRAM clamped it
+    clamped: str                # "", "vram-cuda0" or "vram-cuda1"
+    n_cpu_blocks: int           # leading blocks left in RAM
+    n_gpu_layers: int           # the -ngl that produces that
+    used: tuple
+    budget: tuple
+    weights: tuple
+    kv: tuple
+    recr: tuple
+    compute: int                # mirrored: the same on both cards
+    mirrored: tuple
+    cpu_bytes: int              # weights in RAM (offloaded blocks + token_embd)
+    pool: int                   # bytes -ts slices
+    est_tps: float
+
+    @property
+    def slack(self):
+        return min(b - u for b, u in zip(self.budget, self.used))
+
+    def fits(self):
+        return self.slack >= 0
+
+
+def tensor_fit(info, args, tensors, maps, budgets, gpus, cpu_bw, n_ctx, kv_type,
+               compute_base, mtp_enabled, n_cpu_blocks=0, ts0=None):
+    """
+    Price -sm tensor at one CPU-offload depth, choosing the fastest -ts that
+    still fits both cards.
+
+    Everything the Meta device slices scales with -ts, so the two constraints
+
+        ts0     * P + M + C <= budget0
+        (1-ts0) * P + M + C <= budget1
+
+    give a closed-form feasible interval for ts0 and there is nothing to search:
+    take the bandwidth optimum and clamp it into that interval. M (mirrored
+    weights) and C (compute buffer) are charged to BOTH cards.
+    """
+    split_layer, mirror_layer, split_other, mirror_other, cpu_weight = maps
+
+    n_all = info.n_layer_all
+    i_gpu_start = max(0, min(n_cpu_blocks, n_all))
+    on_gpu = lambda il: il >= i_gpu_start
+
+    gpu_split = sum(nb for il, nb in split_layer.items() if on_gpu(il)) + split_other
+    gpu_mirror = sum(nb for il, nb in mirror_layer.items() if on_gpu(il)) + mirror_other
+    cpu_weights = cpu_weight + sum(
+        nb for d in (split_layer, mirror_layer) for il, nb in d.items() if not on_gpu(il))
+
+    gpu_kv_layers = [il for il in info.main_kv_layers if on_gpu(il)]
+    kv_total = kv_cache_bytes(info, n_ctx, kv_type, gpu_kv_layers, args.parallel,
+                              args.ubatch, args.kv_unified, args.swa_full)
+    n_rs_seq = rs_rollback_depth(info, args, mtp_enabled)
+    rs_per_layer = ((row_size(0, info.n_embd_r) + row_size(0, info.n_embd_s))
+                    * args.parallel * (1 + n_rs_seq))
+    recr_total = rs_per_layer * sum(1 for il in info.recr_layers if on_gpu(il))
+
+    compute = tensor_compute_buffer(info, args, n_ctx, compute_base)
+    if mtp_enabled:
+        compute += mtp_compute_buffer(info, n_ctx, args.ubatch, args.parallel)
+        cached = (info.kv_layers[-info.n_nextn:]
+                  if info.arch in MTP_KV_FILTERED_ARCHS and info.n_nextn
+                  else info.kv_layers)
+        kv_total += kv_cache_bytes(info, n_ctx, KV_TYPE_F16[1],
+                                   [il for il in cached if on_gpu(il)], args.parallel,
+                                   args.ubatch, args.kv_unified, args.swa_full)
+
+    pool = gpu_split + kv_total + recr_total          # sliced by -ts
+    fixed = gpu_mirror + compute                      # charged to both cards
+
+    if pool <= 0:
+        return None
+    hi = (budgets[0] - fixed) / float(pool)           # ts0 ceiling from CUDA0
+    lo = 1.0 - (budgets[1] - fixed) / float(pool)     # ts0 floor from CUDA1
+    if hi < lo or hi <= 0:
+        return None
+
+    ideal = gpus[0].bw / (gpus[0].bw + gpus[1].bw)
+    if ts0 is None:
+        ts0, clamped = ideal, ""
+        if ts0 > hi:
+            ts0, clamped = hi, "vram-cuda0"
+        elif ts0 < lo:
+            ts0, clamped = lo, "vram-cuda1"
+    else:
+        clamped = ""
+    ts0 = min(max(ts0, 0.0), 1.0)
+    shares = (ts0, 1.0 - ts0)
+
+    weights = tuple(shares[i] * gpu_split + gpu_mirror for i in (0, 1))
+    kv = tuple(shares[i] * kv_total for i in (0, 1))
+    recr = tuple(shares[i] * recr_total for i in (0, 1))
+    used = tuple(shares[i] * pool + fixed for i in (0, 1))
+
+    a_split, a_mirror, a_split_other, a_mirror_other = tensor_active_map(tensors, info)
+    act_split = sum(nb for il, nb in a_split.items() if on_gpu(il)) + a_split_other
+    act_mirror = sum(nb for il, nb in a_mirror.items() if on_gpu(il)) + a_mirror_other
+    act_cpu = sum(nb for d in (a_split, a_mirror)
+                  for il, nb in d.items() if not on_gpu(il))
+    per_card = [(shares[i] * act_split + act_mirror) / (gpus[i].bw * 1e9 * MBU_TENSOR)
+                for i in (0, 1)]
+    seconds = max(per_card) + act_cpu / (cpu_bw * 1e9 * MBU_LAYER)
+
+    return TensorFit(
+        ts=(round(ts0, 4), round(1.0 - ts0, 4)), ts_ideal=ideal, clamped=clamped,
+        n_cpu_blocks=i_gpu_start, n_gpu_layers=max(n_all + 1 - i_gpu_start, 0),
+        used=used, budget=tuple(budgets), weights=weights, kv=kv, recr=recr,
+        compute=compute, mirrored=(gpu_mirror, gpu_mirror), cpu_bytes=cpu_weights,
+        pool=pool, est_tps=(1.0 / seconds if seconds > 0 else 0.0))
+
+
+def plan_tensor_split(info, args, tensors, maps, budgets, gpus, cpu_bw, n_ctx,
+                      kv_type, compute_base, mtp_enabled, allow_cpu=True):
+    """
+    Best -sm tensor plan for this context: no CPU offload if the model fits,
+    otherwise the FEWEST leading blocks in RAM that make it fit.
+
+    Leading, not trailing: llama-model.cpp:1361 computes
+        i_gpu_start = max(n_layer_all + 1 - n_gpu_layers, 0)
+    so -ngl keeps the LAST n_gpu_layers on the GPU and the first blocks are the
+    ones that stay behind.
+    """
+    fit = tensor_fit(info, args, tensors, maps, budgets, gpus, cpu_bw, n_ctx,
+                     kv_type, compute_base, mtp_enabled, 0)
+    if fit is not None:
+        return fit
+    if not allow_cpu:
+        return None
+    for k in range(1, info.n_layer_all + 1):
+        fit = tensor_fit(info, args, tensors, maps, budgets, gpus, cpu_bw, n_ctx,
+                         kv_type, compute_base, mtp_enabled, k)
+        if fit is not None:
+            return fit
+    return None
+
+
+def max_ctx_tensor(info, args, tensors, maps, budgets, gpus, cpu_bw, kv_type,
+                   compute_base, mtp_enabled, ctx_cap, granularity=1024):
+    """Largest n_ctx -sm tensor holds with every block on the GPU."""
+    def fits(n_ctx):
+        return plan_tensor_split(info, args, tensors, maps, budgets, gpus, cpu_bw,
+                                 n_ctx, kv_type, compute_base, mtp_enabled,
+                                 allow_cpu=False) is not None
+
+    if not fits(granularity):
+        return 0, None
+    lo, hi = granularity, max(ctx_cap, granularity)
+    if fits(hi):
+        lo = hi
+    else:
+        while lo < hi:
+            mid = (lo + hi + granularity) // 2
+            mid -= mid % granularity
+            if mid <= lo:
+                break
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - granularity
+    return lo, plan_tensor_split(info, args, tensors, maps, budgets, gpus, cpu_bw,
+                                 lo, kv_type, compute_base, mtp_enabled,
+                                 allow_cpu=False)
+
+
+def tensor_command(args, n_ctx, q8, mtp_enabled, fit, ot_flags=None):
+    """The llama-server invocation for a -sm tensor plan."""
+    parts = [f"{args.server_bin} -m {args.model}",
+             f"-ngl {fit.n_gpu_layers if fit.n_cpu_blocks else 99}",
+             "-dev CUDA0,CUDA1", "-sm tensor", f"-ts {fmt_ts(fit.ts)}",
+             f"-c {n_ctx}", f"-ub {args.ubatch}"]
+    if args.parallel != 4:
+        parts.append(f"-np {args.parallel}")
+    if q8:
+        parts += ["-ctk q8_0", "-ctv q8_0"]
+    if ot_flags:
+        parts += [render_ot(ot_flags)] if isinstance(ot_flags, list) else [ot_flags]
+    if mtp_enabled:
+        parts += ["--spec-type draft-mtp"]
+    parts += ["-fa on"]
+    return " \\\n  ".join(parts)
+
+
+def tensor_report(args, info, gpus, tensors, budgets, kv_name, kv_type,
+                  compute_base, compute_src, mtp_enabled, cpu_bw, ctx_cap,
+                  layer_tps=None):
+    """
+    Print the -sm tensor plan. Returns (n_ctx, TensorFit) or (0, None).
+
+    Honours an explicit -c: if that context does not fit, blocks are pushed into
+    RAM and the command says so. With no -c, the largest context that keeps
+    every block on the GPU is reported instead.
+    """
+    e = sys.stderr.write
+    maps = tensor_weight_map(tensors, info)
+
+    e("=" * 74 + "\n")
+    e("-sm tensor  (tensor parallelism -- both cards work on every block)\n")
+    e("=" * 74 + "\n")
+    for g in gpus[:2]:
+        e(f"  CUDA{g.index} {g.name.replace('NVIDIA GeForce ', ''):<16}"
+          f"{g.bw:>8.0f} GB/s\n")
+    ideal = gpus[0].bw / (gpus[0].bw + gpus[1].bw)
+    e(f"  bandwidth-optimal -ts        {ideal:.4f},{1 - ideal:.4f}"
+      f"   (BW_i / sum(BW))\n\n")
+
+    if args.ctx_requested is None:
+        n_ctx, fit = max_ctx_tensor(info, args, tensors, maps, budgets, gpus, cpu_bw,
+                                    kv_type, compute_base, mtp_enabled, ctx_cap)
+        if fit is None:
+            e("Does not fit at any context with every block on the GPU.\n"
+              "Pass an explicit -c to get a plan that spills blocks into RAM.\n\n")
+            return 0, None
+        capped = "  (capped at trained ctx)" if n_ctx >= ctx_cap else ""
+        e(f"No -c given -> largest context that keeps all "
+          f"{info.n_layer_all} blocks on the GPU{capped}\n")
+    else:
+        n_ctx = args.ctx_requested
+        fit = plan_tensor_split(info, args, tensors, maps, budgets, gpus, cpu_bw,
+                                n_ctx, kv_type, compute_base, mtp_enabled)
+        if fit is None:
+            e(f"-c {n_ctx} does not fit even with every block in RAM.\n\n")
+            return 0, None
+        e(f"-c {n_ctx} as requested\n")
+
+    e(f"\nKV {kv_name}  ->  -c {n_ctx}   -sm tensor   -ts {fmt_ts(fit.ts)}\n")
+    if fit.clamped:
+        side = "CUDA0" if fit.clamped == "vram-cuda0" else "CUDA1"
+        e(f"  -ts is CLAMPED by {side}: the optimum is {fit.ts_ideal:.4f} but that "
+          f"overfills {side}.\n"
+          f"  Lower -c (or -ctv q4_0) to free {side} and -ts walks back toward it.\n")
+    if fit.n_cpu_blocks:
+        e(f"  blocks 0-{fit.n_cpu_blocks - 1} STAY IN RAM ({fmt_gib(fit.cpu_bytes)}), "
+          f"blocks {fit.n_cpu_blocks}-{info.n_layer_all - 1} on the GPUs\n"
+          f"  -> -ngl {fit.n_gpu_layers}  (i_gpu_start = n_layer_all + 1 - ngl)\n")
+    e(f"  {'':26s}{'CUDA0':>12}{'CUDA1':>12}\n")
+    rows = [("weights (sliced+mirrored)", fit.weights),
+            (f"KV cache ({kv_name})", fit.kv),
+            (f"recurrent state ({args.parallel} seq)", fit.recr),
+            (f"compute buffer ({compute_src})", (fit.compute, fit.compute))]
+    for label, pair in rows:
+        if not any(pair):
+            continue
+        e(f"  {label:<26}{fmt_mib(pair[0]):>12}{fmt_mib(pair[1]):>12}\n")
+    e(f"  {'-' * 50}\n")
+    e(f"  {'used':<26}{fmt_mib(fit.used[0]):>12}{fmt_mib(fit.used[1]):>12}\n")
+    e(f"  {'of budget':<26}{fmt_mib(fit.budget[0]):>12}{fmt_mib(fit.budget[1]):>12}\n")
+    e(f"  {'left over':<26}{fmt_mib(fit.budget[0] - fit.used[0]):>12}"
+      f"{fmt_mib(fit.budget[1] - fit.used[1]):>12}\n")
+    e(f"  (of the weights, {fmt_mib(fit.mirrored[0])} is MIRRORED -- a full copy on "
+      f"each card)\n")
+    e("\n")
+    e(f"  estimated generation   ~{fit.est_tps:.0f} t/s")
+    if layer_tps:
+        e(f"   (vs ~{layer_tps:.0f} t/s for -sm layer)")
+    e("\n\n")
+    for line in tensor_command(args, n_ctx, kv_type == KV_TYPE_Q8_0[1],
+                               mtp_enabled, fit).split("\n"):
+        e(f"  {line}\n")
+    e("\n")
+    return n_ctx, fit
+
+
+def layer_split_tps(info, tensors, fit, gpus, cpu_bw):
+    """Estimated t/s for a -sm layer plan, so the two modes can be compared."""
+    a_split, a_mirror, a_other_s, a_other_m = tensor_active_map(tensors, info)
+    per_layer = {il: a_split.get(il, 0) + a_mirror.get(il, 0)
+                 for il in set(a_split) | set(a_mirror)}
+    dev = lambda il: 0 if il < fit.boundary else 1
+    on = [0.0, 0.0]
+    for il, nb in per_layer.items():
+        on[dev(il)] += nb
+    on[fit.out_dev] += a_other_s + a_other_m
+    seconds = sum(on[i] / (gpus[i].bw * 1e9 * MBU_LAYER) for i in (0, 1))
+    return 1.0 / seconds if seconds > 0 else 0.0
+
+
+def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_bw=0.0):
     """Print the VRAM budget and the context sizes a two-card layer split affords."""
     e = sys.stderr.write
 
@@ -1570,7 +2163,7 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled):
         e(f"KV {kv_name}  ->  -c {ctx}   -ts {fmt_ts(fit.ts)}{capped}{mark}\n")
         e(f"  blocks 0-{fit.boundary - 1} on CUDA0, {fit.boundary}-{info.n_layer_all - 1} "
           f"on CUDA1; output.weight on CUDA{fit.out_dev}\n")
-        e(f"  {'':22s}{'CUDA0':>12}{'CUDA1':>12}\n")
+        e(f"  {'':26s}{'CUDA0':>12}{'CUDA1':>12}\n")
         rows = [("weights", fit.weights),
                 (f"KV cache ({kv_name})", fit.kv),
                 (f"recurrent state ({args.parallel} seq)", fit.recr),
@@ -1580,11 +2173,11 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled):
         for label, pair in rows:
             if not any(pair):
                 continue
-            e(f"  {label:<22}{fmt_mib(pair[0]):>12}{fmt_mib(pair[1]):>12}\n")
-        e(f"  {'-' * 46}\n")
-        e(f"  {'used':<22}{fmt_mib(fit.used[0]):>12}{fmt_mib(fit.used[1]):>12}\n")
-        e(f"  {'of budget':<22}{fmt_mib(fit.budget[0]):>12}{fmt_mib(fit.budget[1]):>12}\n")
-        e(f"  {'left over':<22}{fmt_mib(fit.budget[0] - fit.used[0]):>12}"
+            e(f"  {label:<26}{fmt_mib(pair[0]):>12}{fmt_mib(pair[1]):>12}\n")
+        e(f"  {'-' * 50}\n")
+        e(f"  {'used':<26}{fmt_mib(fit.used[0]):>12}{fmt_mib(fit.used[1]):>12}\n")
+        e(f"  {'of budget':<26}{fmt_mib(fit.budget[0]):>12}{fmt_mib(fit.budget[1]):>12}\n")
+        e(f"  {'left over':<26}{fmt_mib(fit.budget[0] - fit.used[0]):>12}"
           f"{fmt_mib(fit.budget[1] - fit.used[1]):>12}\n")
         e("\n")
         for line in dense_command(args, ctx, flag == "-q8", mtp_enabled, fit).split("\n"):
@@ -1612,13 +2205,52 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled):
       "smaller card: the same weights at -c 100000 leave the 4060 with 197 MiB free\n"
       "and the 5070 Ti with 2659 MiB. The -ts above is what balances them, so keep it.\n\n")
 
+    # --- the same model under -sm tensor ------------------------------------
+    #
+    # Everything above is a layer split, where -ts only decides which card runs
+    # out of VRAM first. -sm tensor makes -ts a speed knob instead, so it gets
+    # its own plan rather than a footnote.
+    tensor_ctx, tensor_fit_sel = 0, None
+    if args.tensor_split:
+        layer_tps = (layer_split_tps(info, tensors, chosen[4], gpus, cpu_bw)
+                     if chosen[4] else None)
+        tensor_ctx, tensor_fit_sel = tensor_report(
+            args, info, gpus, tensors, budgets, chosen[1], chosen[2],
+            compute_base, compute_src, mtp_enabled, cpu_bw, ctx_cap, layer_tps)
+        if tensor_fit_sel is not None and layer_tps:
+            if tensor_fit_sel.n_cpu_blocks:
+                e(f"NOTE: that plan only reaches -c {tensor_ctx} by keeping "
+                  f"{tensor_fit_sel.n_cpu_blocks} block(s) in RAM, and\n"
+                  f"CPU-resident weights dominate everything else -- "
+                  f"~{tensor_fit_sel.est_tps:.0f} t/s against ~{layer_tps:.0f} t/s for a\n"
+                  f"GPU-only layer split at its own smaller context. Fitting the context is\n"
+                  f"a different goal from going fast; pick which one you actually want.\n\n")
+            elif tensor_fit_sel.est_tps >= layer_tps:
+                e(f"-sm tensor is the recommendation here: "
+                  f"~{tensor_fit_sel.est_tps / layer_tps:.2f}x the layer split's\n"
+                  f"estimated generation rate. Both figures are weights-bytes / bandwidth at\n"
+                  f"{int(MBU_TENSOR * 100)}% / {int(MBU_LAYER * 100)}% of nameplate, measured on this box"
+                  f" -- treat them as a\nRANKING, not a promise.\n\n")
+            else:
+                e(f"The layer split wins here (~{layer_tps:.0f} vs ~{tensor_fit_sel.est_tps:.0f} t/s):"
+                  f" -ts had to be clamped so far\nfrom {tensor_fit_sel.ts_ideal:.3f} that the cards no"
+                  f" longer finish together.\n\n")
+
     # stdout carries the single runnable command for the KV type actually
     # selected on the command line, so `... 2>/dev/null | sh` still works.
+    # The -sm tensor plan wins whenever it exists and is estimated faster.
+    layer_cmd = None
     if chosen[3]:
-        print(dense_command(args, chosen[3], args.q8, mtp_enabled, chosen[4]))
-    else:
-        fallback = variants[1]
-        print(dense_command(args, fallback[3], True, mtp_enabled, fallback[4]))
+        layer_cmd = dense_command(args, chosen[3], args.q8, mtp_enabled, chosen[4])
+    elif variants[1][3]:
+        layer_cmd = dense_command(args, variants[1][3], True, mtp_enabled, variants[1][4])
+    if tensor_fit_sel is not None and (
+            layer_cmd is None or not chosen[3]
+            or tensor_fit_sel.est_tps >= layer_split_tps(info, tensors, chosen[4], gpus, cpu_bw)):
+        print(tensor_command(args, tensor_ctx, chosen[2] == KV_TYPE_Q8_0[1],
+                             mtp_enabled, tensor_fit_sel))
+    elif layer_cmd:
+        print(layer_cmd)
 
 
 def dense_command(args, n_ctx, q8, mtp_enabled, fit=None):
@@ -1639,6 +2271,41 @@ def dense_command(args, n_ctx, q8, mtp_enabled, fit=None):
 # Main
 # --------------------------------------------------------------------------
 
+def moe_tensor_section(args, info, gpus, tensors, mtp_enabled, cpu_bw, md,
+                       kv_name, kv_type):
+    """
+    The -sm tensor alternative for an MoE. Returns the command to put on stdout,
+    or None to leave the -ot plan in charge.
+
+    -ot and -sm tensor are different tools. -ot exists because expert weights are
+    read only n_expert_used/n_expert of the time, so they are the right thing to
+    exile to a slower card or to RAM; -sm tensor slices EVERYTHING by -ts and has
+    no such notion of priority. So -sm tensor is only recommended here when it
+    needs no CPU spill at all -- once weights have to leave VRAM, the -ot plan's
+    ability to choose WHICH ones is worth more than tensor parallelism.
+    """
+    n_ctx_train = int(_mdget(md, info.arch, "context_length", 0) or 0)
+    compute_base = args.compute_buf * MiB if args.compute_buf is not None else None
+    compute_src = "given" if compute_base is not None else "derived"
+    budgets = [gpus[0].budget_bytes - args.reserve0 * MiB,
+               gpus[1].budget_bytes - args.reserve1 * MiB]
+    n_ctx, fit = tensor_report(args, info, gpus, tensors, budgets, kv_name, kv_type,
+                               compute_base, compute_src, mtp_enabled, cpu_bw,
+                               n_ctx_train or (1 << 20))
+    e = sys.stderr.write
+    if fit is None:
+        return None
+    if fit.n_cpu_blocks:
+        e("Keeping the -ot plan: -sm tensor cannot hold this model without pushing\n"
+          "whole blocks into RAM, and -ot spills only expert weights, which are read\n"
+          f"just {max(info.n_expert_used, 1)}/{info.n_expert} of the time. "
+          "The -sm tensor command above is still correct if you want to try it.\n\n")
+        return None
+    e("-sm tensor needs no CPU spill here, so it is the recommendation: both cards\n"
+      "work on every block instead of taking turns.\n\n")
+    return tensor_command(args, n_ctx, kv_type == KV_TYPE_Q8_0[1], mtp_enabled, fit)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Compute llama.cpp -ot tensor overrides for large MoE GGUF models.",
@@ -1646,7 +2313,28 @@ def main():
     ap.add_argument("model", help="path to the .gguf (first shard is fine)")
     ap.add_argument("-q8", "--q8", action="store_true",
                     help="quantise the KV cache to q8_0 (default: f16)")
-    ap.add_argument("-c", "--ctx", type=int, default=65535, help="context size (default 65535)")
+    ap.add_argument("-c", "--ctx", type=int, default=None,
+                    help="context size. GIVEN: plan for exactly this -c, pushing "
+                         "leading blocks into RAM (-ngl) if VRAM cannot hold it. "
+                         "OMITTED: report the largest context that still keeps every "
+                         "block on the GPU. The MoE -ot planner needs a fixed target, "
+                         "so it falls back to %d when -c is omitted." % DEFAULT_MOE_CTX)
+    ap.add_argument("--bw", default=None,
+                    help="override memory bandwidth, GB/s, comma-separated per device, "
+                         "e.g. --bw 896,272. Otherwise read from gpu-bandwidth.json.")
+    ap.add_argument("--cpu-bw", default=None, type=float,
+                    help="system RAM bandwidth, GB/s; prices blocks that spill out of "
+                         "VRAM (default: _cpu_gb_s in gpu-bandwidth.json)")
+    ap.add_argument("--bandwidth-file", default=None,
+                    help="path to the GPU bandwidth table (default: gpu-bandwidth.json "
+                         "next to this script)")
+    ap.add_argument("--no-tensor-split", dest="tensor_split", action="store_false",
+                    default=True,
+                    help="skip the -sm tensor plan and report only the layer split / "
+                         "-ot placement")
+    ap.add_argument("-b", "--batch", type=int, default=2048,
+                    help="logical batch size (llama-server default 2048). Under "
+                         "-sm tensor the KQ mask scales with THIS, not -ub.")
     ap.add_argument("-ub", "--ubatch", type=int, default=512,
                     help="physical batch size, drives the compute-buffer estimate (default 512)")
     ap.add_argument("--swa-full", action="store_true",
@@ -1717,6 +2405,13 @@ def main():
     if not os.path.exists(args.model):
         raise SystemExit(f"error: no such file: {args.model}")
 
+    # -c is optional now. The -sm tensor planner reads the raw value (None means
+    # "find the largest context that fits"); everything downstream of the -ot
+    # planner needs a concrete target, so give it one.
+    args.ctx_requested = args.ctx
+    if args.ctx is None:
+        args.ctx = DEFAULT_MOE_CTX
+
     md, tensors = read_gguf(args.model)
     info = analyse(md, tensors, use_mtp=args.mtp)
     # MTP is on whenever the model can do it, unless --no-mtp. It costs the
@@ -1733,6 +2428,7 @@ def main():
             g.total_bytes = g.free_bytes = g.budget_bytes = v
     if len(gpus) < 2:
         raise SystemExit(f"error: this script assumes 2 GPUs, found {len(gpus)}")
+    cpu_bw = resolve_bandwidths(args, gpus) if args.tensor_split else 0.0
 
     # --- split tensors into expert sets / lookup tables / core ---------------
     expert_bytes = {}
@@ -1764,7 +2460,7 @@ def main():
     # real answer is "wrong tool: use a plain layer split". Report on that split
     # instead -- it is the only sensible way to run a dense model on two cards.
     if not expert_layers:
-        dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled)
+        dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_bw)
         return
 
     # A model with tied embeddings reuses token_embd as the output projection;
@@ -2017,7 +2713,14 @@ def main():
     if fits_entirely:
         e("=> No tensor override needed: the whole model + KV cache fits on CUDA0 + CUDA1.\n")
         e("   Let llama.cpp do its own layer split.\n\n")
-        print(" \\\n  ".join([head] + llama_args + ["-fa on"]))
+        layer_cmd = " \\\n  ".join([head] + llama_args + ["-fa on"])
+        if args.tensor_split:
+            cmd = moe_tensor_section(args, info, gpus, tensors, mtp_enabled, cpu_bw, md,
+                                     kv_name, kv_type)
+            if cmd:
+                print(cmd)
+                return
+        print(layer_cmd)
         return
 
     # -ts 1,0 pins every layer to CUDA0 so the whole KV cache lands there;
@@ -2044,7 +2747,14 @@ def main():
     e("\n")
 
     parts = [head] + llama_args + [render_ot(ot_flags), "-fa on"]
-    print(" \\\n  ".join(parts))
+    ot_cmd = " \\\n  ".join(parts)
+    if args.tensor_split:
+        cmd = moe_tensor_section(args, info, gpus, tensors, mtp_enabled, cpu_bw, md,
+                                 kv_name, kv_type)
+        if cmd:
+            print(cmd)
+            return
+    print(ot_cmd)
 
 
 if __name__ == "__main__":

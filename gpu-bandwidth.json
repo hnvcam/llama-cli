@@ -1,0 +1,27 @@
+{
+  "_README": [
+    "Memory bandwidth per GPU, in GB/s (10^9 bytes/s), keyed by the name",
+    "nvidia-smi reports:  nvidia-smi --query-gpu=name --format=csv,noheader",
+    "",
+    "tensor-override.py uses these numbers to pick the -ts for -sm tensor.",
+    "Tensor parallelism makes both cards work CONCURRENTLY, so a token costs",
+    "max_i(bytes_i / BW_i) instead of the sum, and that max is minimised when",
+    "every card finishes at the same time:   ts_i = BW_i / sum(BW).",
+    "Nothing else in the script needs these, so an entry that is merely close",
+    "is fine -- only the RATIO between your cards moves the chosen -ts.",
+    "",
+    "Add your own cards below. Lookup is exact name first, then",
+    "case-insensitive, then longest matching substring. --bw 896,272",
+    "overrides everything without editing this file.",
+    "",
+    "_cpu_gb_s is system RAM bandwidth. It is used only to price blocks that",
+    "have to spill out of VRAM into RAM (-ngl below the block count), so it",
+    "only has to be the right order of magnitude. Rough guide: dual-channel",
+    "DDR4-3200 ~= 50, dual-channel DDR5-5600 ~= 90, quad-channel ~= 2x that."
+  ],
+
+  "_cpu_gb_s": 50,
+
+  "NVIDIA GeForce RTX 5070 Ti": 896,
+  "NVIDIA GeForce RTX 4060": 272
+}
