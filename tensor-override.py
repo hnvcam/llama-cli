@@ -30,9 +30,12 @@ that fits together with the `-ts` that balances the two cards. See dense_report(
 
 Every model, dense or MoE, ALSO gets a `-sm tensor` plan (tensor parallelism).
 That is usually the faster way to run two cards, because the cards work
-concurrently instead of taking turns, and it makes `-ts` a speed knob with a
-closed-form optimum -- ts_i = BW_i / sum(BW), read out of gpu-bandwidth.json.
-See the block above tensor_weight_map(). Pass --no-tensor-split to skip it.
+concurrently instead of taking turns, and it makes `-ts` a speed knob whose
+optimum is ts_i = BW_i / sum(BW), read out of gpu-bandwidth.json. Careful,
+though: `-ts` is a REQUEST, not a ratio. llama.cpp rounds every cut down to a
+granularity, so on some models the cards can only be split 50/50 or 75/25 no
+matter what you ask for -- see the block above meta_split_config(), which
+ports that rounding. Pass --no-tensor-split to skip the whole section.
 
 `-c` is optional. GIVEN, the plan targets exactly that context and pushes
 leading blocks into RAM (via `-ngl`) if VRAM cannot hold it. OMITTED, the
@@ -51,6 +54,7 @@ Usage:
 """
 
 import argparse
+import functools
 import glob
 import json
 import math
@@ -293,6 +297,8 @@ class ModelInfo:
     n_embd_s: int = 0                  # recurrent ssm-state row elements
     n_swa: int = 0                     # sliding-window width, 0 = no SWA
     swa_layers: list = field(default_factory=list)    # layers on the small SWA cache
+    hp: dict = field(default_factory=dict)            # raw hparams the -sm tensor
+                                       # split port needs; see meta_split_key()
 
 
 # Architectures observed to leave their nextn/MTP block weights unloaded on
@@ -437,8 +443,8 @@ def analyse(md, tensors, use_mtp=False):
         main_kv_layers = list(kv_layers)
 
     # --- KV row widths, mirroring llama_hparams::n_embd_{k,v}_gqa ------------
-    head_count_kv = _per_layer(_mdget(md, arch, "attention.head_count_kv"), n_layer_all,
-                               default=n_head)
+    n_head_kv_l = head_count_kv = _per_layer(
+        _mdget(md, arch, "attention.head_count_kv"), n_layer_all, default=n_head)
     default_head_dim = (n_embd // n_head) if n_head else 0
     key_len = int(_mdget(md, arch, "attention.key_length", default_head_dim) or default_head_dim)
     val_len = int(_mdget(md, arch, "attention.value_length", default_head_dim) or default_head_dim)
@@ -506,6 +512,27 @@ def analyse(md, tensors, use_mtp=False):
     if not swa_layers:
         n_swa = 0
 
+    # Raw hparams the -sm tensor granularity port reads back (llama-model.cpp's
+    # get_split_segments / get_split_granularity work off hparams, not tensor
+    # shapes). Per-layer lists, because head counts are not uniform on every arch.
+    n_head_l = _per_layer(_mdget(md, arch, "attention.head_count"), n_layer_all,
+                          default=n_head)
+    n_ff_l = _per_layer(_mdget(md, arch, "feed_forward_length"), n_layer_all, default=0)
+    head_k_l = []
+    for il in range(n_layer_all):
+        n_kv_head = int(n_head_kv_l[il]) or 1
+        head_k_l.append(n_embd_k_gqa[il] // n_kv_head if il in n_embd_k_gqa else key_len)
+    hp = {
+        "n_head": [int(x) for x in n_head_l],
+        "n_head_kv": [int(x) or 1 for x in n_head_kv_l],
+        "n_embd_head_k": head_k_l,
+        "n_ff": [int(x) for x in n_ff_l],
+        "d_state": int(_mdget(md, arch, "ssm.state_size", 0) or 0),
+        "n_group": int(_mdget(md, arch, "ssm.group_count", 0) or 0),
+        "dt_rank": int(_mdget(md, arch, "ssm.time_step_rank", 0) or 0),
+        "d_conv": int(_mdget(md, arch, "ssm.conv_kernel", 0) or 0),
+    }
+
     return ModelInfo(
         arch=arch,
         name=md.get("general.name", "?"),
@@ -531,6 +558,7 @@ def analyse(md, tensors, use_mtp=False):
         n_embd_s=n_embd_s,
         n_swa=n_swa,
         swa_layers=swa_layers,
+        hp=hp,
     )
 
 
@@ -1504,52 +1532,334 @@ def max_ctx_dense(info, args, layer_bytes, out_bytes, budgets, kv_type, compute_
 # still does), so llama-model.cpp:1005 throws
 #     "device CUDA0 does not support split buffers".
 
-# What the Meta device actually slices. Ported verbatim from the regex list in
-# llama_meta_device_get_split_state (llama-model.cpp:365-399); llama.cpp uses
-# std::regex_match, i.e. the whole name must match, hence the anchors.
+# Not every tensor is sliced. One that no pattern matches is MIRRORED --
+# ggml-backend-meta.cpp keeps a FULL COPY on every card
+# (GGML_BACKEND_SPLIT_AXIS_MIRRORED), so it is charged to BOTH budgets instead
+# of being divided between them. Norms are tiny, but a tied token_embd used as
+# the output projection is not: on gemma-4-31B that is 756 MiB on each card,
+# and leaving it out of the mirrored bucket under-counts CUDA1 by exactly that
+# much. meta_split_config() below is the full port of that classification.
+
+
+# --------------------------------------------------------------------------
+# What -sm tensor ACTUALLY gives each card
+# --------------------------------------------------------------------------
 #
-# A tensor that matches is cut along an axis and each card keeps its slice. A
-# tensor that does NOT match is MIRRORED -- ggml-backend-meta.cpp keeps a FULL
-# COPY on every card (GGML_BACKEND_SPLIT_AXIS_MIRRORED), so it is charged to
-# BOTH budgets instead of being divided between them. Norms are tiny, but a
-# tied token_embd used as the output projection is not: on gemma-4-31B that is
-# 756 MiB on each card, and leaving it out of the mirrored bucket under-counts
-# CUDA1 by exactly that much.
-TENSOR_SPLIT_RES = tuple(re.compile(p + r"\Z") for p in (
-    r"blk\.\d*\.attn_q.weight",
-    r"blk\.\d*\.attn_(k|v).weight",
-    r"blk\.\d*\.attn_qkv.weight",
-    r"blk\.\d*\.attn_q\.bias",
-    r"blk\.\d*\.attn_(k|v)\.bias",
-    r"blk\.\d*\.attn_qkv.bias",
-    r"blk\.\d*\.attn_(q|k)_norm\.weight",
-    r"blk\.\d*\.attn_sinks.weight",
-    r"blk\.\d*\.attn_output.weight",
-    r"blk\.\d*\.attn_output.bias",
-    r"blk\.\d*\.attn_gate.weight",
-    r"blk\.\d*\.ssm_dt.bias",
-    r"blk\.\d*\.ssm_a",
-    r"blk\.\d*\.ssm_alpha.weight",
-    r"blk\.\d*\.ssm_beta.weight",
-    r"blk\.\d*\.ssm_ba.weight",
-    r"blk\.\d*\.ssm_conv1d.weight",
-    r"blk\.\d*\.ssm_out.weight",
-    r"blk\.\d*\.ffn_up(_exps)?.weight",
-    r"blk\.\d*\.ffn_up(_exps)?.bias",
-    r"blk\.\d*\.ffn_gate(_exps)?.weight",
-    r"blk\.\d*\.ffn_gate(_exps)?.bias",
-    r"blk\.\d*\.ffn_gate_up(_exps)?.weight",
-    r"blk\.\d*\.ffn_down(_exps)?.weight",
-    r"blk\.\d*\.ffn_down.bias",
-    r"blk\.\d*\.ffn_down_exps.bias",
-    r"output\.weight",
-    r"output\.bias",
-))
+# -ts is NOT a proportion. llama-model.cpp:700-720 computes each device's slice
+# as
+#     high  = ne_segment * ts_scan[j] / ts_scan.back()
+#     high -= high % granularity
+# so every cut is rounded DOWN to a granularity and the LAST device in the
+# rotation takes whatever is left. When a tensor's split axis is only a few
+# granularities wide the result is wildly coarse: KAT-Coder's expert tensors
+# are 512 wide with granularity 256, so the only reachable cuts are 0, 256 and
+# 512 -- i.e. 0%, 50% or 100%, never the 68% that -ts 0.68 asks for.
+#
+# Worse, the rotation makes the error one-sided. get_tensor_config_impl sets
+# `rotation = get_il_eff(il) % n_devices`, i.e. alternating layers hand out
+# their slices in the opposite order, and the device that goes LAST collects
+# the rounding remainder. On a 2-card box half the layers therefore round
+# CUDA0's share down to 50% and the other half round CUDA1's share down to 0%,
+# leaving CUDA0 with 100%. Averaged over the model that is 75% on CUDA0 for
+# any -ts between 0.5 and 1.0 -- 1.2 GiB more than a proportional model
+# predicts on this one, which is exactly the "CUDA0 OOM" that the old
+# ts * bytes accounting could not see.
+#
+# Verified against llama.cpp b10566+ (KAT-Coder-V2.5 Q4_K_M, -ts 0.6828,0.3172):
+#     load_tensors:  Meta() model buffer size = 14901.13 MiB   <- this port: 14901.12
+#     llama_memory_recurrent: Meta() RS buffer size = 172.73   <- this port: 172.73
+#     llama_kv_cache:         Meta() KV buffer size =  31.88   <- this port:  31.88
+# (the Meta() lines report device 0's share, not the total).
+
+_META_PATS = {key: re.compile(pat + r"\Z") for key, pat in {
+    "q_w":       r"blk\.\d*\.attn_q.weight",
+    "kv_w":      r"blk\.\d*\.attn_(k|v).weight",
+    "qkv_w":     r"blk\.\d*\.attn_qkv.weight",
+    "q_b":       r"blk\.\d*\.attn_q\.bias",
+    "kv_b":      r"blk\.\d*\.attn_(k|v)\.bias",
+    "qkv_b":     r"blk\.\d*\.attn_qkv.bias",
+    "qk_norm":   r"blk\.\d*\.attn_(q|k)_norm\.weight",
+    "sinks":     r"blk\.\d*\.attn_sinks.weight",
+    "ao_w":      r"blk\.\d*\.attn_output.weight",
+    "ao_b":      r"blk\.\d*\.attn_output.bias",
+    "agate":     r"blk\.\d*\.attn_gate.weight",
+    "ssm_dt":    r"blk\.\d*\.ssm_dt.bias",
+    "ssm_a":     r"blk\.\d*\.ssm_a",
+    "ssm_alpha": r"blk\.\d*\.ssm_alpha.weight",
+    "ssm_beta":  r"blk\.\d*\.ssm_beta.weight",
+    "ssm_ba":    r"blk\.\d*\.ssm_ba.weight",
+    "conv1d":    r"blk\.\d*\.ssm_conv1d.weight",
+    "ssm_out":   r"blk\.\d*\.ssm_out.weight",
+    "up_w":      r"blk\.\d*\.ffn_up(_exps)?.weight",
+    "up_b":      r"blk\.\d*\.ffn_up(_exps)?.bias",
+    "gate_w":    r"blk\.\d*\.ffn_gate(_exps)?.weight",
+    "gate_b":    r"blk\.\d*\.ffn_gate(_exps)?.bias",
+    "gateup_w":  r"blk\.\d*\.ffn_gate_up(_exps)?.weight",
+    "down_w":    r"blk\.\d*\.ffn_down(_exps)?.weight",
+    "down_b":    r"blk\.\d*\.ffn_down.bias",
+    "down_exps_b": r"blk\.\d*\.ffn_down_exps.bias",
+    "out_w":     r"output\.weight",
+    "out_b":     r"output\.bias",
+    "k_cache":   r"cache_k_l\d*",
+    "v_cache":   r"cache_v_l\d*",
+    "r_cache":   r"cache_r_l\d*",
+    "s_cache":   r"cache_s_l\d*",
+}.items()}
+
+# The three Qwen 3.5 / 3-Next archs segment their fused QKV and their caches on
+# head boundaries instead of splitting the raw axis (llama-model.cpp:538-580).
+QWEN35_SEG_ARCHS = {"qwen3next", "qwen35", "qwen35moe"}
+
+MIRRORED = None          # every card keeps a full copy
 
 
-def is_split_tensor(name):
-    """True if -sm tensor slices this tensor; False if every card gets a copy."""
-    return any(r.match(name) for r in TENSOR_SPLIT_RES)
+def _mp(key, name):
+    return bool(_META_PATS[key].match(name))
+
+
+def meta_split_config(name, shape):
+    """
+    (axis, reference-tensor suffixes) for one tensor; axis is MIRRORED if
+    -sm tensor gives every card a full copy. The reference tensor is the one
+    whose quant block size sets the granularity -- llama.cpp deliberately looks
+    at a DIFFERENT tensor there (the one the sliced result is multiplied into),
+    so the two have to agree on where the cut lands.
+
+    Port of get_tensor_config (llama-model.cpp:450-528).
+    """
+    if _mp("q_w", name) or _mp("kv_w", name) or _mp("qkv_w", name):
+        return 1, ("attn_output.weight", "ssm_out.weight")
+    if _mp("q_b", name) or _mp("kv_b", name) or _mp("qkv_b", name):
+        return 0, ("attn_output.weight", "ssm_out.weight")
+    if _mp("qk_norm", name):
+        # a 1-D q/k norm has nothing to slice; llama.cpp mirrors it instead
+        axis = MIRRORED if len(shape) < 2 or shape[1] == 1 else 1
+        return axis, ("attn_output.weight",)
+    if _mp("k_cache", name) or _mp("v_cache", name) or _mp("sinks", name):
+        return 0, ("attn_output.weight",)
+    if _mp("ao_w", name):
+        return 0, ()
+    if _mp("ao_b", name):
+        return MIRRORED, ()
+    if _mp("agate", name):
+        return 1, ("attn_output.weight", "ssm_out.weight")
+    if _mp("ssm_dt", name) or _mp("ssm_a", name):
+        return 0, ("ssm_out.weight",)
+    if _mp("ssm_alpha", name) or _mp("ssm_beta", name) or _mp("ssm_ba", name):
+        return 1, ("ssm_out.weight",)
+    if _mp("r_cache", name) or _mp("s_cache", name):
+        return 0, ("ssm_out.weight",)
+    if _mp("conv1d", name):
+        return 1, ("ssm_out.weight",)
+    if _mp("ssm_out", name):
+        return 0, ()
+    if _mp("up_w", name) or _mp("gate_w", name) or _mp("gateup_w", name):
+        return 1, ("ffn_down.weight", "ffn_down_exps.weight")
+    if _mp("up_b", name) or _mp("gate_b", name):
+        return 0, ("ffn_down.weight", "ffn_down_exps.weight")
+    if _mp("down_w", name):
+        return 0, ("ffn_down.weight", "ffn_down_exps.weight")
+    if _mp("down_b", name) or _mp("down_exps_b", name):
+        # down_exps.bias is SPLIT_AXIS_PARTIAL: every card holds the whole
+        # thing and contributes a partial sum, so it costs like a mirror.
+        return MIRRORED, ()
+    if _mp("out_w", name):
+        return 1, ()
+    if _mp("out_b", name):
+        return 0, ()
+    return MIRRORED, ()
+
+
+def meta_split_segments(name, axis, il, ne_axis, info):
+    """
+    [(elements, repeats)] the split axis is cut into. Port of
+    get_split_segments (llama-model.cpp:536-605). A fused tensor is segmented
+    so that each card gets the SAME head range out of every fused part.
+    """
+    hp = info.hp
+    if info.arch in QWEN35_SEG_ARCHS:
+        head_dim = hp["d_state"]
+        n_k_heads, n_v_heads = hp["n_group"], hp["dt_rank"]
+        key_dim, value_dim = head_dim * n_k_heads, head_dim * n_v_heads
+        if info.arch == "qwen3next":
+            if _mp("qkv_w", name) or _mp("conv1d", name):
+                return [(key_dim, 2), (value_dim, 1)]
+        else:
+            ratio = n_v_heads // n_k_heads if n_k_heads else 1
+            if _mp("qkv_w", name) or _mp("conv1d", name):
+                return [(key_dim, 2 + ratio)]
+            if _mp("agate", name) or _mp("ssm_out", name):
+                return [(key_dim, ratio)]
+            if (_mp("ssm_dt", name) or _mp("ssm_a", name)
+                    or _mp("ssm_alpha", name) or _mp("ssm_beta", name)):
+                return [(n_k_heads, ratio)]
+            if _mp("r_cache", name):
+                return [(key_dim * (hp["d_conv"] - 1), 2 + ratio)]
+            if _mp("s_cache", name):
+                return [(n_k_heads * head_dim * head_dim, ratio)]
+        if _mp("gateup_w", name):
+            return [(info.n_ff_exp, 2)]
+        return [(ne_axis, 1)]
+
+    if _mp("qkv_w", name) or _mp("qkv_b", name):
+        n_embd_gqa = info.n_embd_v_gqa.get(il) or info.n_embd_k_gqa.get(il, 0)
+        return [(info.n_embd, 1), (n_embd_gqa, 2)]
+    if _mp("up_w", name) or _mp("up_b", name):
+        n_ff = hp["n_ff"][il] if il < len(hp["n_ff"]) else 0
+        if n_ff and ne_axis == 2 * n_ff:      # fused up+gate, e.g. Phi-3
+            return [(n_ff, 2)]
+        return [(ne_axis, 1)]
+    if _mp("gateup_w", name):
+        return [(info.n_ff_exp, 2)]
+    return [(ne_axis, 1)]
+
+
+def meta_split_granularity(name, blck, il, n_segments, info, n_devices):
+    """
+    Elements each cut must be a multiple of. Port of get_split_granularity
+    (llama-model.cpp:607-685): a slice has to land on a quant block boundary
+    AND on a head boundary, and llama.cpp rounds that up further so the wide
+    kernels stay usable.
+    """
+    hp = info.hp
+    if il in set(info.recr_layers):
+        head_dim = hp["d_state"] or 1
+        g_qkv = math.lcm(math.lcm(blck, 128), head_dim)
+        if (_mp("qkv_w", name) or _mp("agate", name)
+                or _mp("conv1d", name) or _mp("ssm_out", name)):
+            return [g_qkv] * n_segments
+        if (_mp("ssm_dt", name) or _mp("ssm_a", name)
+                or _mp("ssm_alpha", name) or _mp("ssm_beta", name)):
+            return [g_qkv // head_dim] * n_segments
+        if _mp("ssm_ba", name):
+            return [2 * (g_qkv // head_dim)] * n_segments
+        if _mp("r_cache", name):
+            return [g_qkv * (hp["d_conv"] - 1)] * n_segments
+        if _mp("s_cache", name):
+            return [g_qkv * head_dim] * n_segments
+    else:
+        n_head = hp["n_head"][il] if il < len(hp["n_head"]) else 0
+        n_head_kv = hp["n_head_kv"][il] if il < len(hp["n_head_kv"]) else 1
+        n_gqa = max(n_head // max(n_head_kv, 1), 1)
+        n_embd_q = n_gqa * (hp["n_embd_head_k"][il] if il < len(hp["n_embd_head_k"]) else 0)
+        blck_perf = blck
+        while blck_perf < 128 and blck_perf * n_devices < n_embd_q:
+            blck_perf *= 2
+        if n_embd_q:
+            if _mp("sinks", name):
+                return [math.lcm(n_embd_q, blck_perf) // n_embd_q * n_gqa]
+            g_q = math.lcm(n_embd_q, blck_perf)
+            if _mp("q_w", name) or _mp("q_b", name):
+                if info.arch in QWEN35_SEG_ARCHS:   # these carry a Q gate
+                    return [math.lcm(2 * n_embd_q, blck_perf)]
+                return [g_q]
+            if _mp("ao_w", name):
+                return [g_q]
+            g_kv = g_q // n_gqa
+            if _mp("kv_w", name) or _mp("kv_b", name) or _mp("k_cache", name) or _mp("v_cache", name):
+                return [g_kv]
+            if _mp("qkv_w", name) or _mp("qkv_b", name):
+                return [g_q, g_kv]
+    if (_mp("up_w", name) or _mp("up_b", name) or _mp("gate_w", name)
+            or _mp("gate_b", name) or _mp("gateup_w", name) or _mp("down_w", name)):
+        return [math.lcm(blck, 128)] * n_segments
+    return [1] * n_segments
+
+
+def meta_rotation(info, il, per_layer, n_devices):
+    """
+    get_il_eff(il) % n_devices (llama-model.cpp:413-421): the count of PREVIOUS
+    layers of the same kind, so which card gets the rounding remainder
+    alternates down the stack instead of always favouring the same one.
+
+    `per_layer` is false only for the handful of tensors with no block index
+    (output.weight and friends), which llama.cpp rotates by n_layer instead.
+    A cache_*_l<N> tensor DOES belong to a block and rotates with it.
+    """
+    if not per_layer:
+        return info.n_layer % n_devices
+    recr, swa = set(info.recr_layers), set(info.swa_layers)
+    same = sum(1 for p in range(il)
+               if (p in recr) == (il in recr) and (p in swa) == (il in swa))
+    return same % n_devices
+
+
+def meta_split_key(name, shape, il, blck, info, n_devices=2):
+    """
+    Everything about a tensor that decides how -ts divides it, as a hashable
+    key: (segments, granularity, rotation). None for a mirrored tensor.
+    """
+    axis, _ = meta_split_config(name, shape)
+    if axis is MIRRORED:
+        return None
+    ne_axis = shape[axis] if axis < len(shape) else 1
+    segs = meta_split_segments(name, axis, il, ne_axis, info)
+    gran = meta_split_granularity(name, blck, il, len(segs), info, n_devices)
+    rot = meta_rotation(info, il, name.startswith(("blk.", "cache_")), n_devices)
+    return (tuple(segs), tuple(gran), rot)
+
+
+@functools.lru_cache(maxsize=None)
+def split_fracs(key, ts, n_devices=2):
+    """
+    Fraction of a tensor with this split key that each device ends up holding.
+    Port of the assignment loop in llama_meta_device_get_split_state
+    (llama-model.cpp:696-722), remainder-to-the-last-device included.
+    """
+    segments, granularity, rotation = key
+    scan = []
+    for j in range(n_devices):
+        scan.append(ts[(j + rotation) % n_devices])
+        if j:
+            scan[j] += scan[j - 1]
+    dev, total = [0] * n_devices, 0
+    for (ne_s, nr_s), g in zip(segments, granularity):
+        low = 0
+        for j in range(n_devices - 1):
+            high = (int(ne_s * (j + 1) / n_devices) if scan[-1] == 0.0
+                    else int(ne_s * scan[j] / scan[-1]))
+            high -= high % g
+            dev[(j + rotation) % n_devices] += (high - low) * nr_s
+            low = high
+        dev[(n_devices - 1 + rotation) % n_devices] += (ne_s - low) * nr_s
+        total += ne_s * nr_s
+    if total <= 0:
+        return tuple([1.0 / n_devices] * n_devices)
+    return tuple(d / float(total) for d in dev)
+
+
+SPLIT_MAX_STEPS = 512      # beyond this a tensor's split is treated as smooth
+
+
+def split_key_is_stepped(key, max_steps=SPLIT_MAX_STEPS):
+    """
+    True if this key's rounding is coarse enough to matter. A tensor cut into
+    thousands of granularities (a KV cache row, a vocab-sized output matrix)
+    tracks -ts to better than 0.2%, so it is priced as if it were proportional.
+    """
+    segments, granularity, _ = key
+    return any(0 < (ne_s // g if g else 0) <= max_steps
+               for (ne_s, _), g in zip(segments, granularity))
+
+
+def split_breakpoints(keys, max_steps=SPLIT_MAX_STEPS):
+    """
+    The ts0 values at which some tensor's slice actually changes. Because every
+    cut is floor()ed to a granularity, occupancy is a STEP function of -ts:
+    flat between two breakpoints, jumping at them. These are the boundaries of
+    the flat stretches; smooth keys are left out and handled inside each one.
+    """
+    out = set()
+    for key in keys:
+        segments, granularity, rotation = key
+        for (ne_s, _), g in zip(segments, granularity):
+            steps = ne_s // g if g else 0
+            if steps <= 0 or steps > max_steps:
+                continue
+            for k in range(steps + 1):
+                x = k * g / float(ne_s)
+                out.add(x if rotation == 0 else 1.0 - x)
+    return sorted(x for x in out if 0.0 < x < 1.0)
 
 
 # Fraction of nominal bandwidth actually reached during token generation.
@@ -1676,40 +1986,136 @@ def tensor_compute_buffer(info, args, n_ctx, base=None):
     return mask + TENSOR_SCRATCH_PER_UB * args.ubatch
 
 
-def tensor_weight_map(tensors, info):
+@dataclass
+class SplitMaps:
     """
-    Per-block weight bytes under -sm tensor, split into the part -ts slices and
-    the part every card gets a full copy of.
+    Everything -sm tensor slices, bucketed by HOW it gets sliced.
 
-    token_embd is charged twice on purpose. dev_input is unconditionally the CPU
-    (llama-model.cpp:1377), so it always costs a CPU_Mapped buffer; and on a
-    tied-embedding model it is ALSO the output projection, which the split regex
-    list does not match (only a literal "output.weight" does), so a full copy
-    lands on every card as well. Both halves were confirmed against the load log
-    on gemma-4-31B, which prints
+    `sliced[il][key]` is the byte count of the tensors in block `il` that share
+    a split key, so pricing one -ts is a handful of multiplications instead of a
+    pass over 600 tensors -- and, unlike the old `ts * bytes` model, it is the
+    real, granularity-rounded share.
+    """
+    sliced: dict            # il (None = not a block tensor) -> {key: bytes}
+    mirror_layer: dict      # il -> bytes charged to BOTH cards
+    mirror_other: int
+    cpu_bytes: int          # weights that always live in RAM (token_embd)
+    active: dict            # same shape as `sliced`, bytes READ PER TOKEN
+    active_mirror: dict
+    active_mirror_other: float
+    kv_keys: dict           # il -> [key, ...] for that layer's cache_k / cache_v
+    rs_keys: dict           # il -> [key, ...] for that layer's cache_r / cache_s
+
+    @property
+    def keys(self):
+        out = set()
+        for per_layer in (self.sliced,):
+            for d in per_layer.values():
+                out.update(d)
+        for d in (self.kv_keys, self.rs_keys):
+            for keys in d.values():
+                out.update(k for k in keys if k is not None)
+        return out
+
+
+def _ref_blck_size(name, shape, il, by_name):
+    """
+    Block size of the tensor whose rows the cut has to stay aligned to. For
+    most tensors that is a DIFFERENT tensor in the same block (llama.cpp lines
+    up ffn_up's columns with ffn_down's rows), so this has to be looked up.
+    """
+    _, refs = meta_split_config(name, shape)
+    for suffix in refs:
+        ref = by_name.get(f"blk.{il}.{suffix}")
+        if ref is not None:
+            return GGML_TYPE_TRAITS[ref.type_id][0]
+    t = by_name.get(name)
+    return GGML_TYPE_TRAITS[t.type_id][0] if t is not None else 1
+
+
+def _cache_key(name, ne_axis, il, kv_type_id, info, by_name, n_devices=2):
+    """Split key for one of the KV / recurrent cache tensors of block `il`."""
+    shape = (ne_axis, 1)
+    blck = _ref_blck_size(name, shape, il, by_name)
+    return meta_split_key(name, shape, il, blck, info, n_devices)
+
+
+def tensor_split_maps(tensors, info, kv_type_id, n_devices=2):
+    """
+    Bucket every weight and every cache row by its split key.
+
+    token_embd is charged to the CPU on purpose: dev_input is unconditionally
+    the CPU (llama-model.cpp:1377), so it always costs a CPU_Mapped buffer. On a
+    tied-embedding model it is ALSO the output projection, which no split
+    pattern matches, so a full copy lands on every card as well. Both halves
+    were confirmed against the load log on gemma-4-31B, which prints
         CPU_Mapped model buffer size =   756.00 MiB
         Meta()     model buffer size = 13285.19 MiB
     and 0.75*16698.70 + 4.94 + 756.00 = 13284.97.
     """
-    split_layer, mirror_layer = {}, {}
-    split_other = mirror_other = cpu_bytes = 0
-    tied = not any(t.name == "output.weight" for t in tensors)
+    by_name = {t.name: t for t in tensors}
+    sliced, mirror_layer = {}, {}
+    active, active_mirror = {}, {}
+    mirror_other = cpu_bytes = 0
+    active_mirror_other = 0.0
+    tied = "output.weight" not in by_name
+
     for t in tensors:
         if t.layer is not None and t.layer in info.dead_layers:
             continue
+        act = t.nbytes * active_fraction(t.name, info)
         if t.name == "token_embd.weight":
             cpu_bytes += t.nbytes
             if tied:
                 mirror_other += t.nbytes
+                active_mirror_other += act
             continue
-        if t.layer is not None:
-            d = split_layer if is_split_tensor(t.name) else mirror_layer
-            d[t.layer] = d.get(t.layer, 0) + t.nbytes
-        elif is_split_tensor(t.name):
-            split_other += t.nbytes
+        il = t.layer if t.layer is not None else 0
+        blck = _ref_blck_size(t.name, t.shape, il, by_name)
+        key = meta_split_key(t.name, t.shape, il, blck, info, n_devices)
+        if key is None:
+            if t.layer is None:
+                mirror_other += t.nbytes
+                active_mirror_other += act
+            else:
+                mirror_layer[t.layer] = mirror_layer.get(t.layer, 0) + t.nbytes
+                active_mirror[t.layer] = active_mirror.get(t.layer, 0) + act
         else:
-            mirror_other += t.nbytes
-    return split_layer, mirror_layer, split_other, mirror_other, cpu_bytes
+            sliced.setdefault(t.layer, {})
+            sliced[t.layer][key] = sliced[t.layer].get(key, 0) + t.nbytes
+            active.setdefault(t.layer, {})
+            active[t.layer][key] = active[t.layer].get(key, 0) + act
+
+    # The caches are tensors too, and get cut by the same rules. cache_k is
+    # ggml_new_tensor_3d(n_embd_k_gqa, kv_size, n_stream) (llama-kv-cache.cpp:231),
+    # so the SPLIT axis is the narrow one -- on KAT-Coder that is 512 elements
+    # with granularity 256, i.e. the KV cache lands 75/25 no matter what -ts says.
+    kv_keys = {}
+    # kv_layers, not main_kv_layers: an MTP draft context caches blocks the main
+    # one filters out, and tensor_fit prices those too.
+    for il in sorted(set(info.main_kv_layers) | set(info.kv_layers)):
+        keys = [_cache_key(f"cache_k_l{il}", info.n_embd_k_gqa[il], il,
+                           kv_type_id, info, by_name, n_devices)]
+        if info.n_embd_v_gqa[il]:
+            keys.append(_cache_key(f"cache_v_l{il}", info.n_embd_v_gqa[il], il,
+                                   kv_type_id, info, by_name, n_devices))
+        kv_keys[il] = keys
+    rs_keys = {}
+    for il in info.recr_layers:
+        keys = []
+        if info.n_embd_r:
+            keys.append(_cache_key(f"cache_r_l{il}", info.n_embd_r, il,
+                                   0, info, by_name, n_devices))
+        if info.n_embd_s:
+            keys.append(_cache_key(f"cache_s_l{il}", info.n_embd_s, il,
+                                   0, info, by_name, n_devices))
+        rs_keys[il] = keys
+
+    return SplitMaps(sliced=sliced, mirror_layer=mirror_layer,
+                     mirror_other=mirror_other, cpu_bytes=cpu_bytes,
+                     active=active, active_mirror=active_mirror,
+                     active_mirror_other=active_mirror_other,
+                     kv_keys=kv_keys, rs_keys=rs_keys)
 
 
 def active_fraction(name, info):
@@ -1725,9 +2131,12 @@ def active_fraction(name, info):
 
 
 def tensor_active_map(tensors, info):
-    """(sliced, mirrored) bytes READ PER TOKEN, per block, for the t/s estimate."""
-    split_layer, mirror_layer = {}, {}
-    split_other = mirror_other = 0
+    """
+    ({block: bytes}, bytes not in a block) READ PER TOKEN, for the -sm layer
+    t/s estimate. A layer split gives a whole block to one card, so unlike the
+    -sm tensor estimate this does not care which tensors get sliced.
+    """
+    per_layer, other = {}, 0.0
     tied = not any(t.name == "output.weight" for t in tensors)
     for t in tensors:
         if t.layer is not None and t.layer in info.dead_layers:
@@ -1735,16 +2144,13 @@ def tensor_active_map(tensors, info):
         nb = t.nbytes * active_fraction(t.name, info)
         if t.name == "token_embd.weight":
             if tied:
-                mirror_other += nb
+                other += nb
             continue
         if t.layer is not None:
-            d = split_layer if is_split_tensor(t.name) else mirror_layer
-            d[t.layer] = d.get(t.layer, 0) + nb
-        elif is_split_tensor(t.name):
-            split_other += nb
+            per_layer[t.layer] = per_layer.get(t.layer, 0) + nb
         else:
-            mirror_other += nb
-    return split_layer, mirror_layer, split_other, mirror_other
+            other += nb
+    return per_layer, other
 
 
 @dataclass
@@ -1764,6 +2170,9 @@ class TensorFit:
     cpu_bytes: int              # weights in RAM (offloaded blocks + token_embd)
     pool: int                   # bytes -ts slices
     est_tps: float
+    eff_share: float = 0.0      # CUDA0's ACTUAL share of the sliced weights,
+                                # after llama.cpp rounds every cut down to a
+                                # granularity. Rarely equals ts[0].
 
     @property
     def slack(self):
@@ -1773,39 +2182,69 @@ class TensorFit:
         return self.slack >= 0
 
 
-def tensor_fit(info, args, tensors, maps, budgets, gpus, cpu_bw, n_ctx, kv_type,
+def tensor_fit(info, args, maps, budgets, gpus, cpu_bw, n_ctx, kv_type,
                compute_base, mtp_enabled, n_cpu_blocks=0, ts0=None):
     """
     Price -sm tensor at one CPU-offload depth, choosing the fastest -ts that
     still fits both cards.
 
-    Everything the Meta device slices scales with -ts, so the two constraints
+    There is no closed form for the feasible -ts. Every slice is rounded down to
+    a granularity (see split_fracs), so each card's occupancy is a STEP function
+    of -ts: it is flat between two breakpoints and jumps at them. So the search
+    is over the intervals split_breakpoints() marks out -- typically a couple of
+    dozen -- and each one is priced exactly rather than interpolated.
 
-        ts0     * P + M + C <= budget0
-        (1-ts0) * P + M + C <= budget1
-
-    give a closed-form feasible interval for ts0 and there is nothing to search:
-    take the bandwidth optimum and clamp it into that interval. M (mirrored
-    weights) and C (compute buffer) are charged to BOTH cards.
+    An earlier version modelled the split as `ts * bytes`. On a model whose
+    expert tensors are only two granularities wide that under-counted CUDA0 by
+    1.2 GiB and produced plans that OOM on load.
     """
-    split_layer, mirror_layer, split_other, mirror_other, cpu_weight = maps
-
     n_all = info.n_layer_all
     i_gpu_start = max(0, min(n_cpu_blocks, n_all))
-    on_gpu = lambda il: il >= i_gpu_start
+    on_gpu = lambda il: il is None or il >= i_gpu_start
 
-    gpu_split = sum(nb for il, nb in split_layer.items() if on_gpu(il)) + split_other
-    gpu_mirror = sum(nb for il, nb in mirror_layer.items() if on_gpu(il)) + mirror_other
-    cpu_weights = cpu_weight + sum(
-        nb for d in (split_layer, mirror_layer) for il, nb in d.items() if not on_gpu(il))
+    # --- what each card holds, as {key: bytes} plus the mirrored remainder ---
+    sliced, active = {}, {}
+    for src, dst in ((maps.sliced, sliced), (maps.active, active)):
+        for il, per_key in src.items():
+            if not on_gpu(il):
+                continue
+            for key, nb in per_key.items():
+                dst[key] = dst.get(key, 0) + nb
+    gpu_mirror = maps.mirror_other + sum(
+        nb for il, nb in maps.mirror_layer.items() if on_gpu(il))
+    act_mirror = maps.active_mirror_other + sum(
+        nb for il, nb in maps.active_mirror.items() if on_gpu(il))
+    cpu_weights = maps.cpu_bytes + sum(
+        nb for il, per_key in maps.sliced.items() if not on_gpu(il)
+        for nb in per_key.values()) + sum(
+        nb for il, nb in maps.mirror_layer.items() if not on_gpu(il))
+    act_cpu = sum(nb for il, per_key in maps.active.items() if not on_gpu(il)
+                  for nb in per_key.values()) + sum(
+        nb for il, nb in maps.active_mirror.items() if not on_gpu(il))
 
-    gpu_kv_layers = [il for il in info.main_kv_layers if on_gpu(il)]
-    kv_total = kv_cache_bytes(info, n_ctx, kv_type, gpu_kv_layers, args.parallel,
-                              args.ubatch, args.kv_unified, args.swa_full)
+    # --- the caches, per layer, so each one carries its own split key --------
+    base_cells, swa_cells, _ = kv_cell_counts(info, n_ctx, args.parallel, args.ubatch,
+                                              args.kv_unified, args.swa_full)
+    swa = set(info.swa_layers)
+    kv_items = []          # (key, bytes)
+    for il in info.main_kv_layers:
+        if not on_gpu(il):
+            continue
+        cells = swa_cells if il in swa else base_cells
+        widths = [info.n_embd_k_gqa[il]]
+        if info.n_embd_v_gqa[il]:
+            widths.append(info.n_embd_v_gqa[il])
+        for key, width in zip(maps.kv_keys[il], widths):
+            kv_items.append((key, row_size(kv_type, width * cells)))
+
     n_rs_seq = rs_rollback_depth(info, args, mtp_enabled)
-    rs_per_layer = ((row_size(0, info.n_embd_r) + row_size(0, info.n_embd_s))
-                    * args.parallel * (1 + n_rs_seq))
-    recr_total = rs_per_layer * sum(1 for il in info.recr_layers if on_gpu(il))
+    rs_items = []
+    for il in info.recr_layers:
+        if not on_gpu(il):
+            continue
+        widths = [w for w in (info.n_embd_r, info.n_embd_s) if w]
+        for key, width in zip(maps.rs_keys[il], widths):
+            rs_items.append((key, row_size(0, width) * args.parallel * (1 + n_rs_seq)))
 
     compute = tensor_compute_buffer(info, args, n_ctx, compute_base)
     if mtp_enabled:
@@ -1813,55 +2252,90 @@ def tensor_fit(info, args, tensors, maps, budgets, gpus, cpu_bw, n_ctx, kv_type,
         cached = (info.kv_layers[-info.n_nextn:]
                   if info.arch in MTP_KV_FILTERED_ARCHS and info.n_nextn
                   else info.kv_layers)
-        kv_total += kv_cache_bytes(info, n_ctx, KV_TYPE_F16[1],
-                                   [il for il in cached if on_gpu(il)], args.parallel,
-                                   args.ubatch, args.kv_unified, args.swa_full)
-
-    pool = gpu_split + kv_total + recr_total          # sliced by -ts
-    fixed = gpu_mirror + compute                      # charged to both cards
-
-    if pool <= 0:
-        return None
-    hi = (budgets[0] - fixed) / float(pool)           # ts0 ceiling from CUDA0
-    lo = 1.0 - (budgets[1] - fixed) / float(pool)     # ts0 floor from CUDA1
-    if hi < lo or hi <= 0:
-        return None
+        for il in cached:
+            if not on_gpu(il):
+                continue
+            cells = swa_cells if il in swa else base_cells
+            widths = [info.n_embd_k_gqa[il]]
+            if info.n_embd_v_gqa[il]:
+                widths.append(info.n_embd_v_gqa[il])
+            for key, width in zip(maps.kv_keys[il], widths):
+                kv_items.append((key, row_size(KV_TYPE_F16[1], width * cells)))
 
     ideal = gpus[0].bw / (gpus[0].bw + gpus[1].bw)
-    if ts0 is None:
-        ts0, clamped = ideal, ""
-        if ts0 > hi:
-            ts0, clamped = hi, "vram-cuda0"
-        elif ts0 < lo:
-            ts0, clamped = lo, "vram-cuda1"
-    else:
-        clamped = ""
-    ts0 = min(max(ts0, 0.0), 1.0)
-    shares = (ts0, 1.0 - ts0)
+    pool = sum(sliced.values()) + sum(nb for _, nb in kv_items + rs_items)
+    if pool <= 0:
+        return None
 
-    weights = tuple(shares[i] * gpu_split + gpu_mirror for i in (0, 1))
-    kv = tuple(shares[i] * kv_total for i in (0, 1))
-    recr = tuple(shares[i] * recr_total for i in (0, 1))
-    used = tuple(shares[i] * pool + fixed for i in (0, 1))
+    def evaluate(ts_0):
+        # -ts reaches llama.cpp as the 4 decimals the command line carries, so
+        # price exactly that number and nothing finer.
+        ts_0 = round(min(max(ts_0, 0.0), 1.0), 4)
+        ts = (ts_0, 1.0 - ts_0)
+        share = lambda key: split_fracs(key, ts)
+        w = [gpu_mirror + sum(share(k)[i] * nb for k, nb in sliced.items())
+             for i in (0, 1)]
+        kv = [sum(share(k)[i] * nb for k, nb in kv_items) for i in (0, 1)]
+        rs = [sum(share(k)[i] * nb for k, nb in rs_items) for i in (0, 1)]
+        used = tuple(w[i] + kv[i] + rs[i] + compute for i in (0, 1))
+        act = [act_mirror + sum(share(k)[i] * nb for k, nb in active.items())
+               for i in (0, 1)]
+        per_card = [act[i] / (gpus[i].bw * 1e9 * MBU_TENSOR) for i in (0, 1)]
+        seconds = max(per_card) + (act_cpu / (cpu_bw * 1e9 * MBU_LAYER) if cpu_bw else 0.0)
+        sliced0 = sum(share(k)[0] * nb for k, nb in sliced.items())
+        sliced_all = sum(sliced.values()) or 1
+        return TensorFit(
+            ts=(ts_0, round(1.0 - ts_0, 4)), ts_ideal=ideal, clamped="",
+            n_cpu_blocks=i_gpu_start, n_gpu_layers=max(n_all + 1 - i_gpu_start, 0),
+            used=used, budget=tuple(budgets), weights=tuple(w), kv=tuple(kv),
+            recr=tuple(rs), compute=compute, mirrored=(gpu_mirror, gpu_mirror),
+            cpu_bytes=cpu_weights, pool=pool, eff_share=sliced0 / sliced_all,
+            est_tps=(1.0 / seconds if seconds > 0 else 0.0))
 
-    a_split, a_mirror, a_split_other, a_mirror_other = tensor_active_map(tensors, info)
-    act_split = sum(nb for il, nb in a_split.items() if on_gpu(il)) + a_split_other
-    act_mirror = sum(nb for il, nb in a_mirror.items() if on_gpu(il)) + a_mirror_other
-    act_cpu = sum(nb for d in (a_split, a_mirror)
-                  for il, nb in d.items() if not on_gpu(il))
-    per_card = [(shares[i] * act_split + act_mirror) / (gpus[i].bw * 1e9 * MBU_TENSOR)
-                for i in (0, 1)]
-    seconds = max(per_card) + act_cpu / (cpu_bw * 1e9 * MBU_LAYER)
+    if ts0 is not None:
+        return evaluate(ts0)
 
-    return TensorFit(
-        ts=(round(ts0, 4), round(1.0 - ts0, 4)), ts_ideal=ideal, clamped=clamped,
-        n_cpu_blocks=i_gpu_start, n_gpu_layers=max(n_all + 1 - i_gpu_start, 0),
-        used=used, budget=tuple(budgets), weights=weights, kv=kv, recr=recr,
-        compute=compute, mirrored=(gpu_mirror, gpu_mirror), cpu_bytes=cpu_weights,
-        pool=pool, est_tps=(1.0 / seconds if seconds > 0 else 0.0))
+    # Walk the flat intervals. Inside one, the coarsely-rounded tensors do not
+    # move at all and only the smooth ones track -ts, so the old closed form is
+    # still right THERE: price the interval's midpoint once, then slide -ts
+    # along the smooth pool until it hits a budget or the interval's edge, and
+    # take the point nearest the bandwidth optimum. Every pick is re-priced
+    # exactly before it is accepted, so the linear step never decides a fit.
+    smooth_pool = sum(nb for k, nb in list(sliced.items()) + kv_items + rs_items
+                      if not split_key_is_stepped(k))
+    edges = [0.0] + split_breakpoints(maps.keys) + [1.0]
+    best = None
+    for lo, hi in zip(edges, edges[1:]):
+        if hi - lo < 2e-4:
+            continue
+        mid = (lo + hi) / 2.0
+        probe = evaluate(mid)
+        if smooth_pool > 0:
+            room_hi = mid + (budgets[0] - probe.used[0]) / float(smooth_pool)
+            room_lo = mid - (budgets[1] - probe.used[1]) / float(smooth_pool)
+        else:
+            room_hi = 1.0 if probe.used[0] <= budgets[0] else -1.0
+            room_lo = 0.0 if probe.used[1] <= budgets[1] else 2.0
+        a, b = max(lo, room_lo), min(hi, room_hi)
+        if a > b:
+            continue
+        pick = round(min(max(ideal, a), b), 4)
+        if not lo < pick < hi:          # the rounding left the interval
+            pick = round(mid, 4)
+        fit = evaluate(pick)
+        if fit.fits() and (best is None or fit.est_tps > best.est_tps):
+            best = fit
+    if best is None:
+        return None
+    # Say which card kept -ts away from the bandwidth optimum, if either did.
+    at_ideal = evaluate(round(ideal, 4))
+    if not at_ideal.fits():
+        over = [i for i in (0, 1) if at_ideal.used[i] > budgets[i]]
+        best.clamped = "vram-cuda0" if 0 in over else "vram-cuda1"
+    return best
 
 
-def plan_tensor_split(info, args, tensors, maps, budgets, gpus, cpu_bw, n_ctx,
+def plan_tensor_split(info, args, maps, budgets, gpus, cpu_bw, n_ctx,
                       kv_type, compute_base, mtp_enabled, allow_cpu=True):
     """
     Best -sm tensor plan for this context: no CPU offload if the model fits,
@@ -1872,25 +2346,25 @@ def plan_tensor_split(info, args, tensors, maps, budgets, gpus, cpu_bw, n_ctx,
     so -ngl keeps the LAST n_gpu_layers on the GPU and the first blocks are the
     ones that stay behind.
     """
-    fit = tensor_fit(info, args, tensors, maps, budgets, gpus, cpu_bw, n_ctx,
+    fit = tensor_fit(info, args, maps, budgets, gpus, cpu_bw, n_ctx,
                      kv_type, compute_base, mtp_enabled, 0)
     if fit is not None:
         return fit
     if not allow_cpu:
         return None
     for k in range(1, info.n_layer_all + 1):
-        fit = tensor_fit(info, args, tensors, maps, budgets, gpus, cpu_bw, n_ctx,
+        fit = tensor_fit(info, args, maps, budgets, gpus, cpu_bw, n_ctx,
                          kv_type, compute_base, mtp_enabled, k)
         if fit is not None:
             return fit
     return None
 
 
-def max_ctx_tensor(info, args, tensors, maps, budgets, gpus, cpu_bw, kv_type,
+def max_ctx_tensor(info, args, maps, budgets, gpus, cpu_bw, kv_type,
                    compute_base, mtp_enabled, ctx_cap, granularity=1024):
     """Largest n_ctx -sm tensor holds with every block on the GPU."""
     def fits(n_ctx):
-        return plan_tensor_split(info, args, tensors, maps, budgets, gpus, cpu_bw,
+        return plan_tensor_split(info, args, maps, budgets, gpus, cpu_bw,
                                  n_ctx, kv_type, compute_base, mtp_enabled,
                                  allow_cpu=False) is not None
 
@@ -1909,7 +2383,7 @@ def max_ctx_tensor(info, args, tensors, maps, budgets, gpus, cpu_bw, kv_type,
                 lo = mid
             else:
                 hi = mid - granularity
-    return lo, plan_tensor_split(info, args, tensors, maps, budgets, gpus, cpu_bw,
+    return lo, plan_tensor_split(info, args, maps, budgets, gpus, cpu_bw,
                                  lo, kv_type, compute_base, mtp_enabled,
                                  allow_cpu=False)
 
@@ -1943,7 +2417,7 @@ def tensor_report(args, info, gpus, tensors, budgets, kv_name, kv_type,
     every block on the GPU is reported instead.
     """
     e = sys.stderr.write
-    maps = tensor_weight_map(tensors, info)
+    maps = tensor_split_maps(tensors, info, kv_type)
 
     e("=" * 74 + "\n")
     e("-sm tensor  (tensor parallelism -- both cards work on every block)\n")
@@ -1956,7 +2430,7 @@ def tensor_report(args, info, gpus, tensors, budgets, kv_name, kv_type,
       f"   (BW_i / sum(BW))\n\n")
 
     if args.ctx_requested is None:
-        n_ctx, fit = max_ctx_tensor(info, args, tensors, maps, budgets, gpus, cpu_bw,
+        n_ctx, fit = max_ctx_tensor(info, args, maps, budgets, gpus, cpu_bw,
                                     kv_type, compute_base, mtp_enabled, ctx_cap)
         if fit is None:
             e("Does not fit at any context with every block on the GPU.\n"
@@ -1967,7 +2441,7 @@ def tensor_report(args, info, gpus, tensors, budgets, kv_name, kv_type,
           f"{info.n_layer_all} blocks on the GPU{capped}\n")
     else:
         n_ctx = args.ctx_requested
-        fit = plan_tensor_split(info, args, tensors, maps, budgets, gpus, cpu_bw,
+        fit = plan_tensor_split(info, args, maps, budgets, gpus, cpu_bw,
                                 n_ctx, kv_type, compute_base, mtp_enabled)
         if fit is None:
             e(f"-c {n_ctx} does not fit even with every block in RAM.\n\n")
@@ -2000,6 +2474,13 @@ def tensor_report(args, info, gpus, tensors, budgets, kv_name, kv_type,
       f"{fmt_mib(fit.budget[1] - fit.used[1]):>12}\n")
     e(f"  (of the weights, {fmt_mib(fit.mirrored[0])} is MIRRORED -- a full copy on "
       f"each card)\n")
+    if abs(fit.eff_share - fit.ts[0]) > 0.005:
+        e(f"  NOTE: -ts {fit.ts[0]:.4f} does NOT mean {fit.ts[0] * 100:.1f}% on CUDA0. "
+          f"llama.cpp rounds every cut\n"
+          f"  down to a granularity, so CUDA0 really gets "
+          f"{fit.eff_share * 100:.1f}% of the sliced weights\n"
+          f"  ({(1 - fit.eff_share) * 100:.1f}% on CUDA1). The table above is the "
+          f"rounded reality, not the ratio.\n")
     e("\n")
     e(f"  estimated generation   ~{fit.est_tps:.0f} t/s")
     if layer_tps:
@@ -2014,14 +2495,12 @@ def tensor_report(args, info, gpus, tensors, budgets, kv_name, kv_type,
 
 def layer_split_tps(info, tensors, fit, gpus, cpu_bw):
     """Estimated t/s for a -sm layer plan, so the two modes can be compared."""
-    a_split, a_mirror, a_other_s, a_other_m = tensor_active_map(tensors, info)
-    per_layer = {il: a_split.get(il, 0) + a_mirror.get(il, 0)
-                 for il in set(a_split) | set(a_mirror)}
+    per_layer, other = tensor_active_map(tensors, info)
     dev = lambda il: 0 if il < fit.boundary else 1
     on = [0.0, 0.0]
     for il, nb in per_layer.items():
         on[dev(il)] += nb
-    on[fit.out_dev] += a_other_s + a_other_m
+    on[fit.out_dev] += other
     seconds = sum(on[i] / (gpus[i].bw * 1e9 * MBU_LAYER) for i in (0, 1))
     return 1.0 / seconds if seconds > 0 else 0.0
 
