@@ -24,13 +24,15 @@ cd ~/Workplace/llama.cpp/build/bin/
   -ngl 99 \
   -dev CUDA0,CUDA1 \
   -sm tensor \
-  -ts 0.7279,0.2721 \
-  -c 92160 \
+  -ts 0.7022,0.2978 \
+  -c 117760 \
   -ub 256 \
+  -np 1 \
+  -kvu \
   -ctk q8_0 \
   -ctv q8_0 \
   --spec-type draft-mtp \
-  -fa on -np 1 \
+  -fa on \
   --mmproj /media/hnvcam/AI/LLAMA_Models/Qwen3.8-27B-mmproj-bf16.gguf \
   --temp 1.0 --top-p 0.95 --top-k 20 \
   --port 1234
