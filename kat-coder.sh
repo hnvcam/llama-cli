@@ -27,7 +27,9 @@ cd ~/Workplace/llama.cpp/build/bin/
   -ngl 99 \
   -dev CUDA0,CUDA1 \
   -c 131072 \
-  -ub 512 \
+  -ub 256 \
+  -np 2 \
+  -kvu \
   -ctk q8_0 \
   -ctv q8_0 \
   -fa on \

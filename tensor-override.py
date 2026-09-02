@@ -956,7 +956,8 @@ def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lo
 
     cmd = [server, "-m", model_path, "-ngl", "99", "-dev", "CUDA0,CUDA1", "-ts", "1,0",
            "-c", str(args.ctx), "-ub", str(args.ubatch), "-fa", "on",
-           "--parallel", str(args.parallel), "-lv", "5", "--no-ui",
+           "--parallel", str(args.parallel),
+           "-kvu" if args.kv_unified else "-no-kvu", "-lv", "5", "--no-ui",
            "--port", str(args.measure_port)]
     if probe:
         cmd += ["-ot", ",".join(f"{p}={d}" for p, d in probe)]
@@ -1139,6 +1140,129 @@ def pack(expert_layers, expert_bytes, lookup_bytes, core_bytes,
         else:
             lk_cpu.append(name)
     return gpu0, gpu1, cpu, lk_gpu1, lk_cpu, used0, used1
+
+
+# --------------------------------------------------------------------------
+# MoE: pricing one context, and finding the largest that stays in VRAM
+# --------------------------------------------------------------------------
+
+def moe_mask_bytes(info, args, n_ctx):
+    """The KQ-mask term inside a layer split's compute buffer at n_ctx."""
+    if not info.main_kv_layers:
+        return 0
+    kv_size = int(math.ceil(n_ctx / 256.0) * 256)
+    return kv_size * args.ubatch * 4 * max(args.parallel, 1)
+
+
+def moe_compute_growth(info, args, n_ctx, base_ctx, mtp_enabled):
+    """
+    How much more compute buffer n_ctx needs than base_ctx did, as
+    (main context, MTP draft context).
+
+    estimate_compute_buffer() carries no n_ctx term, and --measure reads one
+    number out of one load; both are therefore only true AT the context they
+    were established at. That is fine while the plan is priced at a fixed -c,
+    but max_ctx_moe() walks n_ctx, and the KQ mask inside the buffer grows with
+    the cache. So keep the base value at base_ctx and charge only the growth
+    above it -- the same mask term dense_compute_buffer() uses, because the -ot
+    layout IS a layer split (-ts 1,0 just makes it a lopsided one).
+
+    Never negative: below base_ctx the base is kept as-is. It is a deliberate
+    upper bound with a 1024 MiB floor, and shrinking it would make the plan
+    optimistic in the one direction that OOMs on load.
+    """
+    grow = moe_mask_bytes(info, args, n_ctx) - moe_mask_bytes(info, args, base_ctx)
+    mtp_grow = 0
+    if mtp_enabled:
+        mtp_grow = (mtp_compute_buffer(info, n_ctx, args.ubatch, args.parallel)
+                    - mtp_compute_buffer(info, base_ctx, args.ubatch, args.parallel))
+    return max(grow, 0), max(mtp_grow, 0)
+
+
+@dataclass
+class MoeFit:
+    """One priced -ot plan: what pack() decided at n_ctx, and what it cost."""
+    n_ctx: int
+    packed: tuple
+    kv_bytes: int
+    mtp_kv_bytes: int
+    compute_bytes: int
+    mtp_compute_bytes: int
+    fixed0: int
+    fixed1: int
+
+    @property
+    def fits_entirely(self):
+        _g0, _g1, cpu_layers, _lk1, lk_cpu, _u0, _u1 = self.packed
+        return not cpu_layers and not lk_cpu
+
+
+def moe_fit(info, args, n_ctx, kv_type, expert_layers, expert_bytes, lookup_bytes,
+            core_bytes, recr_bytes, compute_base, base_ctx, mtp_compute_base,
+            mtp_enabled, measured, measured_mtp, gpu0_budget, gpu1_budget):
+    """Price the -ot plan at exactly one context. None if it cannot fit at all."""
+    kv_bytes = kv_cache_bytes(info, n_ctx, kv_type, None, args.parallel,
+                              args.ubatch, args.kv_unified, args.swa_full)
+    mtp_kv_bytes = (mtp_kv_cache_bytes(info, n_ctx, None, args.parallel,
+                                       args.ubatch, args.kv_unified, args.swa_full)
+                    if mtp_enabled else 0)
+    growth, mtp_growth = moe_compute_growth(info, args, n_ctx, base_ctx, mtp_enabled)
+    compute_bytes = compute_base + growth
+    mtp_compute_bytes = mtp_compute_base + mtp_growth
+    fixed0 = kv_bytes + recr_bytes + compute_bytes + mtp_kv_bytes + mtp_compute_bytes
+    # CUDA1 holds only expert weights, but it still takes part in the graph and
+    # so allocates its own compute buffer. Measured 328.06 MiB (Ling) and
+    # 150.07 MiB (LongCat), so a fraction of CUDA0's with a floor.
+    #
+    # Priced off compute_base, NOT compute_bytes: `growth` is the KQ mask, and
+    # -ts 1,0 puts every KV cell on CUDA0, so CUDA1 has no mask to allocate.
+    # The two are equal whenever n_ctx == base_ctx, which is every -c given.
+    fixed1 = max(int(compute_base * args.compute_buf1_frac), 256 * MiB)
+    if "CUDA1" in measured:
+        fixed1 = max(measured["CUDA1"], 256 * MiB)
+    # The MTP graph only touches the nextn block, whose weights are core tensors
+    # pinned to CUDA0, so llama.cpp reserves nothing on CUDA1 for it (measured
+    # 0.00 MiB on LongCat). Trust a measurement if we have one, add nothing if not.
+    fixed1 += measured_mtp.get("CUDA1", 0)
+
+    packed = pack(expert_layers, expert_bytes, lookup_bytes, core_bytes,
+                  fixed0, fixed1, gpu0_budget, gpu1_budget)
+    if packed is None:
+        return None
+    return MoeFit(n_ctx, packed, kv_bytes, mtp_kv_bytes, compute_bytes,
+                  mtp_compute_bytes, fixed0, fixed1)
+
+
+def max_ctx_moe(fit_at, ctx_cap, granularity=1024):
+    """
+    Largest n_ctx whose -ot plan keeps every weight in VRAM.
+
+    "Runnable" here means the same thing max_ctx_tensor() means by it: nothing
+    spilled to RAM. A plan that pushes expert layers onto the CPU runs at any
+    context you like -- it just gets slower with every layer it gives up -- so
+    that is a different question, and the caller keeps the old fixed-ctx plan
+    for it. KV grows monotonically with n_ctx, so a binary search is valid.
+    """
+    def fits(n_ctx):
+        fit = fit_at(n_ctx)
+        return fit is not None and fit.fits_entirely
+
+    if not fits(granularity):
+        return 0, None
+    lo, hi = granularity, max(ctx_cap, granularity)
+    if fits(hi):
+        lo = hi
+    else:
+        while lo < hi:
+            mid = (lo + hi + granularity) // 2
+            mid -= mid % granularity
+            if mid <= lo:
+                break
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - granularity
+    return lo, fit_at(lo)
 
 
 # --------------------------------------------------------------------------
@@ -2388,14 +2512,26 @@ def max_ctx_tensor(info, args, maps, budgets, gpus, cpu_bw, kv_type,
                                  allow_cpu=False)
 
 
+def parallel_flags(args):
+    """
+    -np plus the matching kv-unified flag.
+
+    llama-server's default is -np -1 ("auto"), which means 4 slots AND
+    kv_unified = true (server.cpp:152-158). Naming -np explicitly -- at any
+    value, 4 included -- leaves kv_unified at its own default of false
+    (common.h:563), which resizes the KV cache out from under the plan. So the
+    command always states both.
+    """
+    return [f"-np {args.parallel}", "-kvu" if args.kv_unified else "-no-kvu"]
+
+
 def tensor_command(args, n_ctx, q8, mtp_enabled, fit, ot_flags=None):
     """The llama-server invocation for a -sm tensor plan."""
     parts = [f"{args.server_bin} -m {args.model}",
              f"-ngl {fit.n_gpu_layers if fit.n_cpu_blocks else 99}",
              "-dev CUDA0,CUDA1", "-sm tensor", f"-ts {fmt_ts(fit.ts)}",
              f"-c {n_ctx}", f"-ub {args.ubatch}"]
-    if args.parallel != 4:
-        parts.append(f"-np {args.parallel}")
+    parts += parallel_flags(args)
     if q8:
         parts += ["-ctk q8_0", "-ctv q8_0"]
     if ot_flags:
@@ -2723,13 +2859,29 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
         layer_cmd = dense_command(args, chosen[3], args.q8, mtp_enabled, chosen[4])
     elif variants[1][3]:
         layer_cmd = dense_command(args, variants[1][3], True, mtp_enabled, variants[1][4])
-    if tensor_fit_sel is not None and (
-            layer_cmd is None or not chosen[3]
-            or tensor_fit_sel.est_tps >= layer_split_tps(info, tensors, chosen[4], gpus, cpu_bw)):
-        print(tensor_command(args, tensor_ctx, chosen[2] == KV_TYPE_Q8_0[1],
-                             mtp_enabled, tensor_fit_sel))
+    tensor_cmd = (tensor_command(args, tensor_ctx, chosen[2] == KV_TYPE_Q8_0[1],
+                                 mtp_enabled, tensor_fit_sel)
+                  if tensor_fit_sel is not None else None)
+
+    take_tensor = tensor_cmd is not None and (
+        layer_cmd is None or not chosen[3]
+        or tensor_fit_sel.est_tps >= layer_split_tps(info, tensors, chosen[4], gpus, cpu_bw))
+    # --prefer means the same thing here as on the MoE path: it decides which
+    # command comes out uncommented, so the one you want is copy-pasteable.
+    if args.prefer == "tensor" and tensor_cmd is not None:
+        take_tensor = True
+    elif args.prefer == "no-sm" and layer_cmd is not None:
+        take_tensor = False
+    elif args.prefer != "auto":
+        e(f"--prefer {args.prefer}: that plan does not exist for this model, "
+          f"emitting the other one.\n\n")
+
+    if take_tensor:
+        emit_commands(tensor_cmd, [(f"layer split, no -sm, -c {chosen[3]}",
+                                    layer_cmd, "--prefer no-sm")])
     elif layer_cmd:
-        print(layer_cmd)
+        emit_commands(layer_cmd, [(f"-sm tensor, -c {tensor_ctx}",
+                                   tensor_cmd, "--prefer tensor")])
 
 
 def dense_command(args, n_ctx, q8, mtp_enabled, fit=None):
@@ -2738,6 +2890,7 @@ def dense_command(args, n_ctx, q8, mtp_enabled, fit=None):
     if fit is not None:
         parts.append(f"-ts {fmt_ts(fit.ts)}")
     parts += [f"-c {n_ctx}", f"-ub {args.ubatch}"]
+    parts += parallel_flags(args)
     if q8:
         parts += ["-ctk q8_0", "-ctv q8_0"]
     if mtp_enabled:
@@ -2753,8 +2906,9 @@ def dense_command(args, n_ctx, q8, mtp_enabled, fit=None):
 def moe_tensor_section(args, info, gpus, tensors, mtp_enabled, cpu_bw, md,
                        kv_name, kv_type):
     """
-    The -sm tensor alternative for an MoE. Returns the command to put on stdout,
-    or None to leave the -ot plan in charge.
+    The -sm tensor alternative for an MoE. Returns
+    (command or None, is_the_recommendation, n_ctx), so the caller can print the
+    losing plan as a commented-out alternative instead of throwing it away.
 
     -ot and -sm tensor are different tools. -ot exists because expert weights are
     read only n_expert_used/n_expert of the time, so they are the right thing to
@@ -2773,16 +2927,40 @@ def moe_tensor_section(args, info, gpus, tensors, mtp_enabled, cpu_bw, md,
                                n_ctx_train or (1 << 20))
     e = sys.stderr.write
     if fit is None:
-        return None
+        return None, False, 0
+    cmd = tensor_command(args, n_ctx, kv_type == KV_TYPE_Q8_0[1], mtp_enabled, fit)
     if fit.n_cpu_blocks:
         e("Keeping the -ot plan: -sm tensor cannot hold this model without pushing\n"
           "whole blocks into RAM, and -ot spills only expert weights, which are read\n"
           f"just {max(info.n_expert_used, 1)}/{info.n_expert} of the time. "
           "The -sm tensor command above is still correct if you want to try it.\n\n")
-        return None
+        return cmd, False, n_ctx
     e("-sm tensor needs no CPU spill here, so it is the recommendation: both cards\n"
       "work on every block instead of taking turns.\n\n")
-    return tensor_command(args, n_ctx, kv_type == KV_TYPE_Q8_0[1], mtp_enabled, fit)
+    return cmd, True, n_ctx
+
+
+def emit_commands(chosen, alternatives=()):
+    """
+    stdout carries exactly one runnable command; alternatives go to stderr.
+
+    Every command printed anywhere has to be selectable off the console and
+    pasted as-is, so NOTHING is `#`-prefixed. The thing that keeps
+    `... 2>/dev/null | sh` unambiguous is the STREAM, not a comment marker: the
+    report is already on stderr, and an alternative plan is report material.
+
+    Each alternative is (label, command, flag-that-moves-it-to-stdout).
+    """
+    e = sys.stderr.write
+    for label, cmd, flag in alternatives:
+        if not cmd:
+            continue
+        e(f"Alternative -- {label}\n")
+        e(f"({flag} puts this one on stdout instead)\n\n")
+        e(cmd + "\n\n")
+    sys.stderr.flush()
+    print(chosen)
+    sys.stdout.flush()
 
 
 def main():
@@ -2796,8 +2974,11 @@ def main():
                     help="context size. GIVEN: plan for exactly this -c, pushing "
                          "leading blocks into RAM (-ngl) if VRAM cannot hold it. "
                          "OMITTED: report the largest context that still keeps every "
-                         "block on the GPU. The MoE -ot planner needs a fixed target, "
-                         "so it falls back to %d when -c is omitted." % DEFAULT_MOE_CTX)
+                         "weight on the GPU -- separately for the -ot plan and for "
+                         "-sm tensor, since the two ceilings differ; both commands are "
+                         "printed, the recommended one live and the other commented "
+                         "out. Falls back to %d only when no context at all is "
+                         "GPU-resident." % DEFAULT_MOE_CTX)
     ap.add_argument("--bw", default=None,
                     help="override memory bandwidth, GB/s, comma-separated per device, "
                          "e.g. --bw 896,272. Otherwise read from gpu-bandwidth.json.")
@@ -2811,6 +2992,12 @@ def main():
                     default=True,
                     help="skip the -sm tensor plan and report only the layer split / "
                          "-ot placement")
+    ap.add_argument("--prefer", choices=("auto", "no-sm", "tensor"), default="auto",
+                    help="which plan stdout emits UNCOMMENTED (default auto: whichever "
+                         "the report recommends). The other is printed commented out, "
+                         "so --prefer is how you copy-paste or pipe the one you want "
+                         "without stripping a '#' off every line. Unlike "
+                         "--no-tensor-split this still computes and reports both.")
     ap.add_argument("-b", "--batch", type=int, default=2048,
                     help="logical batch size (llama-server default 2048). Under "
                          "-sm tensor the KQ mask scales with THIS, not -ub.")
@@ -2824,11 +3011,14 @@ def main():
     ap.add_argument("--no-kv-unified", dest="kv_unified", action="store_false", default=True,
                     help="plan for a per-slot (non-unified) KV cache. llama-server's "
                          "default -np -1 means 4 slots with kv_unified = true "
-                         "(server.cpp:152-158), which is the default here; pass this only "
-                         "if you also pass an explicit -np N to llama-server.")
-    ap.add_argument("--parallel", type=int, default=4,
+                         "(server.cpp:152-158), which is the default here; pass this to price "
+                         "the per-slot cache instead. Either way the emitted command spells the "
+                         "choice out as -kvu / -no-kvu next to its -np.")
+    ap.add_argument("-np", "--parallel", type=int, default=4,
                     help="number of server slots; sizes the recurrent state. llama-server's "
-                         "default is auto -> 4 slots with kv_unified, so 4 is the default here too.")
+                         "default is auto -> 4 slots with kv_unified, so 4 is the default here too. "
+                         "Every emitted command carries this -np explicitly, plus -kvu, because an "
+                         "explicit -np disables llama-server's auto kv_unified (server.cpp:152-158).")
     ap.add_argument("--no-mtp", dest="mtp", action="store_false", default=True,
                     help="do NOT use the model's MTP/nextn blocks. By default, if the GGUF ships "
                          "nextn tensors the plan budgets for them and the command carries "
@@ -2949,16 +3139,10 @@ def main():
         core_bytes += lookup_bytes.pop("token_embd.weight", 0)
     FAMILY_SIZES["ngram_embd"] = {n for n in lookup_bytes if n.startswith("ngram_embd.")}
 
+    n_ctx_train = int(_mdget(md, info.arch, "context_length", 0) or 0)
     kv_name, kv_type = KV_TYPE_Q8_0 if args.q8 else KV_TYPE_F16
-    kv_bytes = kv_cache_bytes(info, args.ctx, kv_type, None, args.parallel,
-                              args.ubatch, args.kv_unified, args.swa_full)
     recr_bytes = recurrent_state_bytes(info, args.parallel,
                                        rs_rollback_depth(info, args, mtp_enabled))
-    # --spec-type draft-mtp builds a SECOND llama_context on the same model, with
-    # its own KV cache (usually a full duplicate) and its own compute buffer.
-    mtp_kv_bytes = (mtp_kv_cache_bytes(info, args.ctx, None, args.parallel,
-                                       args.ubatch, args.kv_unified, args.swa_full)
-                    if mtp_enabled else 0)
     measured, measured_mtp = {}, {}
     if args.compute_buf is not None:
         compute_bytes = args.compute_buf * MiB
@@ -2982,20 +3166,51 @@ def main():
 
     gpu0_budget = gpus[0].budget_bytes - args.reserve0 * MiB
     gpu1_budget = gpus[1].budget_bytes - args.reserve1 * MiB
-    fixed0 = kv_bytes + recr_bytes + compute_bytes + mtp_kv_bytes + mtp_compute_bytes
-    # CUDA1 holds only expert weights, but it still takes part in the graph and
-    # so allocates its own compute buffer. Measured 328.06 MiB (Ling) and
-    # 150.07 MiB (LongCat), so a fraction of CUDA0's with a floor.
-    fixed1 = max(int(compute_bytes * args.compute_buf1_frac), 256 * MiB)
-    if "CUDA1" in measured:
-        fixed1 = max(measured["CUDA1"], 256 * MiB)
-    # The MTP graph only touches the nextn block, whose weights are core tensors
-    # pinned to CUDA0, so llama.cpp reserves nothing on CUDA1 for it (measured
-    # 0.00 MiB on LongCat). Trust a measurement if we have one, add nothing if not.
-    fixed1 += measured_mtp.get("CUDA1", 0)
 
-    packed = pack(expert_layers, expert_bytes, lookup_bytes, core_bytes,
-                  fixed0, fixed1, gpu0_budget, gpu1_budget)
+    # Everything above is context-independent, so one closure prices the whole
+    # -ot plan at any -c. The compute buffer was established at args.ctx (that
+    # is the -c --measure loaded with), which is the baseline growth is charged
+    # against; see moe_compute_growth.
+    base_ctx = args.ctx
+    def fit_at(n_ctx):
+        return moe_fit(info, args, n_ctx, kv_type, expert_layers, expert_bytes,
+                       lookup_bytes, core_bytes, recr_bytes, compute_bytes, base_ctx,
+                       mtp_compute_bytes, mtp_enabled, measured, measured_mtp,
+                       gpu0_budget, gpu1_budget)
+
+    # No -c given: answer the question that was actually asked -- how much
+    # context can this box hold with every weight still in VRAM? The -ot planner
+    # used to be pinned to DEFAULT_MOE_CTX here, which both under-reports what
+    # fits and, when it does not fit, silently spills expert layers into RAM.
+    # DEFAULT_MOE_CTX survives only as the fallback for a model that cannot be
+    # GPU-resident at ANY context; there, spilling is the only plan there is.
+    ctx_note = ""
+    if args.ctx_requested is None:
+        ctx_cap = n_ctx_train or (1 << 20)
+        best_ctx, best_fit = max_ctx_moe(fit_at, ctx_cap)
+        if best_fit is not None:
+            args.ctx = best_ctx
+            ctx_note = ("   (largest that keeps every weight in VRAM"
+                        + (", capped at trained ctx)" if best_ctx >= ctx_cap else ")"))
+        else:
+            ctx_note = (f"   (no context is GPU-resident; falling back to "
+                        f"{DEFAULT_MOE_CTX} and spilling)")
+
+    fit = fit_at(args.ctx)
+    packed = fit.packed if fit is not None else None
+    if fit is not None:
+        kv_bytes, mtp_kv_bytes = fit.kv_bytes, fit.mtp_kv_bytes
+        compute_bytes, mtp_compute_bytes = fit.compute_bytes, fit.mtp_compute_bytes
+        fixed0, fixed1 = fit.fixed0, fit.fixed1
+    else:
+        # Only the error report below runs from here, and it needs the numbers
+        # that made the plan infeasible.
+        kv_bytes = kv_cache_bytes(info, args.ctx, kv_type, None, args.parallel,
+                                  args.ubatch, args.kv_unified, args.swa_full)
+        mtp_kv_bytes = (mtp_kv_cache_bytes(info, args.ctx, None, args.parallel,
+                                           args.ubatch, args.kv_unified, args.swa_full)
+                        if mtp_enabled else 0)
+        fixed0 = kv_bytes + recr_bytes + compute_bytes + mtp_kv_bytes + mtp_compute_bytes
 
     if packed is None:
         # KV + state + compute + core alone overflow CUDA0. There is no valid
@@ -3051,6 +3266,10 @@ def main():
             "is_mla": info.is_mla,
             "fits_entirely_on_gpu": fits_entirely,
             "kv_type": kv_name,
+            "n_ctx": args.ctx,
+            "n_ctx_source": ("requested" if args.ctx_requested is not None
+                             else "max-gpu-resident" if ctx_note and "largest" in ctx_note
+                             else "fallback-not-gpu-resident"),
             "mtp_enabled": mtp_enabled,
             "bytes": {
                 "weights_total": weights_bytes,
@@ -3112,6 +3331,8 @@ def main():
         e(f"MTP           : declared ({info.n_nextn} block(s)) but the nextn tensors are not in\n"
           f"                this GGUF, so MTP is unusable\n")
     e(f"Context       : {args.ctx}   KV type: {kv_name}   ubatch: {args.ubatch}\n")
+    if ctx_note:
+        e(f"                {ctx_note.strip()}\n")
     e("\n")
 
     total_lookup = sum(lookup_bytes.values())
@@ -3183,6 +3404,7 @@ def main():
     e("\n")
 
     llama_args = ["-ngl 99", "-dev CUDA0,CUDA1", f"-c {args.ctx}", f"-ub {args.ubatch}"]
+    llama_args += parallel_flags(args)
     if args.q8:
         llama_args += ["-ctk q8_0", "-ctv q8_0"]
     if mtp_enabled:
@@ -3192,48 +3414,65 @@ def main():
     if fits_entirely:
         e("=> No tensor override needed: the whole model + KV cache fits on CUDA0 + CUDA1.\n")
         e("   Let llama.cpp do its own layer split.\n\n")
-        layer_cmd = " \\\n  ".join([head] + llama_args + ["-fa on"])
-        if args.tensor_split:
-            cmd = moe_tensor_section(args, info, gpus, tensors, mtp_enabled, cpu_bw, md,
-                                     kv_name, kv_type)
-            if cmd:
-                print(cmd)
-                return
-        print(layer_cmd)
-        return
+        no_sm_cmd = " \\\n  ".join([head] + llama_args + ["-fa on"])
+        no_sm_label = f"plain layer split, no -sm, -c {args.ctx}"
+    else:
+        # -ts 1,0 pins every layer to CUDA0 so the whole KV cache lands there;
+        # -ot then relocates expert weights only.
+        llama_args.insert(2, "-ts 1,0")
+        e(f"=> {len(plan.cpu_expert_layers)} expert layer(s) must live on CPU.\n")
+        e("   -ts 1,0 pins all layers (hence the whole KV cache) to CUDA0;\n")
+        e("   -ot then moves expert weights out to CUDA1 / CPU.\n")
 
-    # -ts 1,0 pins every layer to CUDA0 so the whole KV cache lands there;
-    # -ot then relocates expert weights only.
-    llama_args.insert(2, "-ts 1,0")
-    e(f"=> {len(plan.cpu_expert_layers)} expert layer(s) must live on CPU.\n")
-    e("   -ts 1,0 pins all layers (hence the whole KV cache) to CUDA0;\n")
-    e("   -ot then moves expert weights out to CUDA1 / CPU.\n")
+        ram_avail = 0
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        ram_avail = int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        if ram_avail and plan.cpu_bytes < ram_avail * 0.9:
+            e(f"   {fmt_gib(plan.cpu_bytes)} lands on CPU and you have {fmt_gib(ram_avail)} available;\n")
+            e("   add --no-mmap for better performance (llama.cpp recommends it with CPU overrides).\n")
+        elif ram_avail:
+            e(f"   {fmt_gib(plan.cpu_bytes)} lands on CPU vs {fmt_gib(ram_avail)} available RAM --\n")
+            e("   keep mmap enabled (do NOT use --no-mmap) or you will swap.\n")
+        e("\n")
 
-    ram_avail = 0
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    ram_avail = int(line.split()[1]) * 1024
-    except OSError:
-        pass
-    if ram_avail and plan.cpu_bytes < ram_avail * 0.9:
-        e(f"   {fmt_gib(plan.cpu_bytes)} lands on CPU and you have {fmt_gib(ram_avail)} available;\n")
-        e("   add --no-mmap for better performance (llama.cpp recommends it with CPU overrides).\n")
-    elif ram_avail:
-        e(f"   {fmt_gib(plan.cpu_bytes)} lands on CPU vs {fmt_gib(ram_avail)} available RAM --\n")
-        e("   keep mmap enabled (do NOT use --no-mmap) or you will swap.\n")
-    e("\n")
+        no_sm_cmd = " \\\n  ".join([head] + llama_args + [render_ot(ot_flags), "-fa on"])
+        no_sm_label = f"-ot placement, no -sm, -c {args.ctx}"
 
-    parts = [head] + llama_args + [render_ot(ot_flags), "-fa on"]
-    ot_cmd = " \\\n  ".join(parts)
+    tensor_cmd, tensor_wins, tensor_ctx = None, False, 0
     if args.tensor_split:
-        cmd = moe_tensor_section(args, info, gpus, tensors, mtp_enabled, cpu_bw, md,
-                                 kv_name, kv_type)
-        if cmd:
-            print(cmd)
-            return
-    print(ot_cmd)
+        tensor_cmd, tensor_wins, tensor_ctx = moe_tensor_section(
+            args, info, gpus, tensors, mtp_enabled, cpu_bw, md, kv_name, kv_type)
+
+    # With no -c the two plans answer the same question with different numbers:
+    # -sm tensor slices everything uniformly, so its ceiling is usually the lower
+    # one. Both go to stdout -- the recommendation runs, the alternative is
+    # commented out, so `... 2>/dev/null | sh` still executes exactly one command.
+    take_tensor = tensor_wins
+    if args.prefer == "tensor" and tensor_cmd is None:
+        e("--prefer tensor: there is no -sm tensor plan for this model, so the -ot\n"
+          "plan is what stdout carries.\n\n")
+    elif args.prefer == "tensor":
+        take_tensor = True
+    elif args.prefer == "no-sm":
+        take_tensor = False
+
+    if take_tensor:
+        chosen, alt = tensor_cmd, (no_sm_label, no_sm_cmd, "--prefer no-sm")
+        if args.ctx_requested is None and args.ctx > tensor_ctx:
+            e(f"The alternative below it reaches -c {args.ctx} instead of "
+              f"{tensor_ctx} by dropping\n-sm tensor: the cards take turns, but a "
+              f"{args.ctx / max(tensor_ctx, 1):.1f}x longer context fits.\n"
+              f"Re-run with --prefer no-sm if the context matters more than the "
+              f"tokens/sec.\n\n")
+    else:
+        chosen = no_sm_cmd
+        alt = (f"-sm tensor, -c {tensor_ctx}", tensor_cmd, "--prefer tensor")
+    emit_commands(chosen, [alt] if args.ctx_requested is None and alt[1] else [])
 
 
 if __name__ == "__main__":

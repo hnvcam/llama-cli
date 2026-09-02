@@ -103,10 +103,10 @@ gives you a runnable script and still shows you the reasoning.
 | Flag | Default | What it does |
 | --- | --- | --- |
 | `model` | *(required)* | Path to the `.gguf`. For a split model, pass any shard — it finds `-00001-of-000NN` siblings automatically and errors if one is missing. |
-| `-c`, `--ctx` | `65535` | Context size. Drives the KV cache calculation, which is usually the single biggest non-weight consumer of CUDA0. |
+| `-c`, `--ctx` | *(searched)* | Context size. Drives the KV cache calculation, which is usually the single biggest non-weight consumer of CUDA0. **Omit it** and the script reports the largest `-c` that keeps every weight in VRAM — separately for the `-ot` plan and for `-sm tensor`, since the two ceilings differ, printing both commands (the recommended one live, the other commented out). It falls back to `65535` with a CPU spill only when no context at all is GPU-resident. |
 | `-q8`, `--q8` | off | Quantise the KV cache to `q8_0` instead of `f16`, and add `-ctk q8_0 -ctv q8_0` to the emitted command. Roughly halves KV size; on a 16 GB card at long context this is often what makes a plan feasible at all. |
 | `-ub`, `--ubatch` | `512` | Physical batch size. Only affects the *estimated* compute buffer (larger ubatch → more scratch). Passed through to the emitted command. |
-| `--parallel` | `4` | Number of server slots. Sizes the recurrent (SSM/KDA) state, which is per-sequence and independent of context length. Matches llama-server's auto default of 4 slots with unified KV. |
+| `-np`, `--parallel` | `4` | Number of server slots, spelled like llama-server's own `-np`. Sizes the recurrent (SSM/KDA) state, which is per-sequence and independent of context length. Matches llama-server's auto default of 4 slots with unified KV. **Every emitted command carries `-np` explicitly**, together with `-kvu` (or `-no-kvu` under `--no-kv-unified`): naming `-np` at all — even `-np 4` — turns off the auto `kv_unified` that llama-server only applies to `-np -1` (`server.cpp:152-158`), so the KV flag has to be stated alongside it or the cache is sized differently from the plan. |
 
 ### MTP / speculative decoding
 
@@ -233,7 +233,9 @@ on every later run. It takes priority over everything and costs nothing.
 
 | Flag | What it does |
 | --- | --- |
-| *(none)* | Full report on stderr, `llama-server` command on stdout. |
+| *(none)* | Full report on stderr, `llama-server` command on stdout. When both a `-sm tensor` and a no-`-sm` plan exist, stdout carries the recommended one live and the other commented out — a `#` comment eats the trailing `\`, so piping into a shell still runs exactly one. |
+| `--prefer {auto,no-sm,tensor}` | Which plan comes out **uncommented**, default `auto` (whatever the report recommends). This is how you copy-paste or pipe the other one without stripping a `#` off every line. Both plans are still computed and reported, unlike `--no-tensor-split`. |
+| `--no-tensor-split` | Do not compute the `-sm tensor` plan at all; report and emit only the layer split / `-ot` placement. |
 | `--flags-only` | Print just the `-ot` argument (or a comment saying none is needed). |
 | `--json` | Machine-readable plan: byte accounting, per-device expert layer lists, lookup table placement, and every `-ot` pattern. |
 | `--server-bin` | How the emitted command should invoke llama-server. Default `./llama-server`. |

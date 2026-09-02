@@ -142,6 +142,27 @@ form survives only *inside* an interval, for tensors cut finer than
 ./tensor-override.py MODEL.gguf -q8 -c 59392 --measure  # exact plan for a ctx
 ```
 
+**No `-c` on an MoE emits two commands.** `max_ctx_moe` binary-searches the
+largest `-c` whose `-ot` plan keeps every weight in VRAM, and `max_ctx_tensor`
+does the same for `-sm tensor`; the two ceilings differ, usually with tensor
+lower, because it slices everything uniformly. stdout carries the recommended
+command live and the other commented out — a `#` comment eats the trailing `\`,
+so `... 2>/dev/null | sh` still runs exactly one. `DEFAULT_MOE_CTX` (65535) is
+now only the fallback for a model that is not GPU-resident at any context.
+With `-c` given, every number is byte-identical to before.
+
+**`--prefer {auto,no-sm,tensor}` picks which one is live**, so the command you
+want is copy-pasteable instead of `#`-prefixed line by line; the header above
+each commented block names the flag that flips it. `dense_report` honours it
+too and now prints the same pair — on gemma-4 that is `-sm tensor -c 26624`
+against a layer split at `-c 37888`. `--no-tensor-split` remains the stronger
+form: it does not compute the tensor plan at all.
+
+Because `estimate_compute_buffer` and `--measure` carry no `n_ctx` term, the
+search charges `moe_compute_growth` — the `dense_compute_buffer` KQ-mask term —
+for any `-c` **above** the one the buffer was established at, and nothing below
+it. On KAT-Coder that is 480 -> 536 MiB going from 65535 to the searched 72704.
+
 `--measure` loads the model once and reads the real compute buffer. **Use it for
 any tight fit** — the estimate is a coarse upper bound and was 1,024 MiB vs a
 measured 462 MiB on KAT-Coder, which is the difference between "needs `-ot`" and

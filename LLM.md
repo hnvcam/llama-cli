@@ -274,6 +274,14 @@ nvidia-smi                                  # 1. nothing else holding VRAM?
 ./tensor-override.py MODEL.gguf -q8 -c 59392 -ub 256 --measure   # 3. exact plan
 ```
 
+Step 2 prints **two** commands for an MoE, because "the biggest context" has two
+different answers. `-sm tensor` slices every tensor across both cards, so its
+ceiling is usually the lower one; dropping `-sm` lets the cards take turns but
+fits a longer context. The tool's pick runs, the other is commented out — so
+you can pipe it straight into a shell. If you want the other one, do not strip
+the `#` by hand — re-run with `--prefer no-sm` (or `--prefer tensor`) and it
+comes out live instead. Dense models print the same pair for the same reason.
+
 Then run the command it prints. If it emits a `-ts`, the tool now tells you what
 that `-ts` **really** does:
 

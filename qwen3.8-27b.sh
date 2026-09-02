@@ -21,15 +21,17 @@ cd ~/Workplace/llama.cpp/build/bin/
 # for the MTP variant; MTP is on by default whenever the GGUF ships nextn).
 
 ./llama-server -m /media/hnvcam/AI/LLAMA_Models/Qwen3.8-27B-UD-Q4_K_M.gguf \
-    -ngl 99 \
-    -dev CUDA0,CUDA1 \
-    -ts 0.75,0.25 \
-    -c 86016 \
-    -ub 256 \
-    -ctk q8_0 \
-    -ctv q8_0 \
-    --spec-type draft-mtp \
-    -fa on \
+  -ngl 99 \
+  -dev CUDA0,CUDA1 \
+  -sm tensor \
+  -ts 0.7279,0.2721 \
+  -c 92160 \
+  -ub 256 \
+  -ctk q8_0 \
+  -ctv q8_0 \
+  --spec-type draft-mtp \
+  -fa on -np 1 \
+  --mmproj /media/hnvcam/AI/LLAMA_Models/Qwen3.8-27B-mmproj-bf16.gguf \
   --temp 1.0 --top-p 0.95 --top-k 20 \
   --port 1234
 
