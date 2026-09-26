@@ -114,6 +114,7 @@ GGML_TYPE_TRAITS = {
     40: (64, 36),    # nvfp4
     41: (128, 18),   # q1_0
     42: (64, 18),    # q2_0
+    142: (128, 34),  # pq2_0 (bonsai fork)
 }
 
 GGML_TYPE_NAMES = {
@@ -123,6 +124,7 @@ GGML_TYPE_NAMES = {
     20: "iq4_nl", 21: "iq3_s", 22: "iq2_s", 23: "iq4_xs", 24: "i8", 25: "i16",
     26: "i32", 27: "i64", 28: "f64", 29: "iq1_m", 30: "bf16", 34: "tq1_0",
     35: "tq2_0", 39: "mxfp4", 40: "nvfp4", 41: "q1_0", 42: "q2_0",
+    142: "pq2_0",
 }
 
 # KV cache element types selectable via -ctk/-ctv, as (name, ggml type id).

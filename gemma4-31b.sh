@@ -40,16 +40,17 @@ cd ~/Workplace/llama.cpp/build/bin/
 # generous. Both load.
 
 ./llama-server -m /media/hnvcam/AI/LLAMA_Models/gemma-4-31B-it-Q4_K_M.gguf \
-    -ngl 99 \
-    -dev CUDA0,CUDA1 \
-    -sm tensor \
-    -ts 0.75,0.25 \
-    -c 32768 \
-    -np 1 \
-    -ub 512 \
-    -ctk q8_0 \
-    -ctv q8_0 \
-    -fa on \
+  -ngl 99 \
+  -dev CUDA0,CUDA1 \
+  -sm tensor \
+  -ts 0.7083,0.2917 \
+  -c 53248 \
+  -ub 256 \
+  -np 1 \
+  -kvu \
+  -ctk q8_0 \
+  -ctv q8_0 \
+  -fa on \
   --temp 1.0 --top-p 0.95 --top-k 64 \
   --port 1234
 

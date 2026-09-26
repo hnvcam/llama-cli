@@ -22,7 +22,7 @@ cd ~/Workplace/llama.cpp/build/bin/
 # Regenerate: ./tensor-override.py <model.gguf> --no-mtp --measure
 # (add -q8 for a q8_0 KV cache: 2340 MiB -> 1243 MiB, room for one more layer.)
 
-./llama-server -m /media/hnvcam/AI/LMStudio_Models/unsloth/gpt-oss-120b-GGUF/gpt-oss-120b-Q8_0-00001-of-00002.gguf \
+./llama-server -m /media/hnvcam/AI/LLAMA_Models/gpt-oss-120b-Q8_0-00001-of-00002.gguf \
   -ngl 99 \
   -dev CUDA0,CUDA1 \
   -ts 1,0 \

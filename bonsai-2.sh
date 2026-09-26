@@ -1,7 +1,7 @@
 #!/bin/bash
 set -m   # turn on job control, even in a non-interactive script
 
-cd ~/Workplace/llama.cpp/build/bin/
+cd ~/Workplace/llama.cpp-bonsai/build/bin/
 
 # -ts 0.7197,0.2803 puts blocks 0-47 on CUDA0 and 48-64 + output.weight on
 # CUDA1. Without it llama.cpp splits by free VRAM and overfills the 4060: at
@@ -20,19 +20,16 @@ cd ~/Workplace/llama.cpp/build/bin/
 # Regenerate: ./tensor-override.py <model.gguf> -q8 --no-mtp   (drop --no-mtp
 # for the MTP variant; MTP is on by default whenever the GGUF ships nextn).
 
-./llama-server -m /media/hnvcam/AI/LLAMA_Models/Qwen3.8-27B-UD-Q4_K_M.gguf \
+./llama-server -m /media/hnvcam/AI/LLAMA_Models/Ternary-Bonsai-2-27B-PQ2_0.gguf \
   -ngl 99 \
   -dev CUDA0,CUDA1 \
-  -ts 0.75,0.25 \
-  -c 110592 \
-  -ub 256 \
+  -ts 0.7615,0.2385 \
+  -c 131072 \
+  -ub 1024 \
   -np 1 \
   -kvu \
-  -ctk q8_0 \
-  -ctv q8_0 \
-  --spec-type draft-mtp \
   -fa on \
-  --mmproj /media/hnvcam/AI/LLAMA_Models/Qwen3.8-27B-mmproj-Q5_K.gguf \
+  --mmproj /media/hnvcam/AI/LLAMA_Models/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf \
   --temp 1.0 --top-p 0.95 --top-k 20 \
   --port 1234
 

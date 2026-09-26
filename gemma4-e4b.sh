@@ -20,20 +20,17 @@ cd ~/Workplace/llama.cpp/build/bin/
 # Regenerate: ./tensor-override.py <model.gguf> -q8 --no-mtp   (drop --no-mtp
 # for the MTP variant; MTP is on by default whenever the GGUF ships nextn).
 
-./llama-server -m /media/hnvcam/AI/LLAMA_Models/Qwen3.8-27B-UD-Q4_K_M.gguf \
+CUDA_VISIBLE_DEVICES=1 ./llama-server -m /media/hnvcam/AI/LMStudio_Models/lmstudio-community/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf \
   -ngl 99 \
-  -dev CUDA0,CUDA1 \
-  -ts 0.75,0.25 \
-  -c 110592 \
+  -c 131072 \
   -ub 256 \
   -np 1 \
   -kvu \
   -ctk q8_0 \
   -ctv q8_0 \
-  --spec-type draft-mtp \
   -fa on \
-  --mmproj /media/hnvcam/AI/LLAMA_Models/Qwen3.8-27B-mmproj-Q5_K.gguf \
-  --temp 1.0 --top-p 0.95 --top-k 20 \
+  --mmproj /media/hnvcam/AI/LMStudio_Models/lmstudio-community/gemma-4-E4B-it-GGUF/mmproj-gemma-4-E4B-it-BF16.gguf \
+  --temp 1.0 --top-p 0.95 --top-k 64 \
   --port 1234
 
 cd ~/Workplace/llama-cli
