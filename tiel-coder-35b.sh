@@ -20,21 +20,20 @@ cd ~/Workplace/llama.cpp/build/bin/
 # Regenerate: ./tensor-override.py <model.gguf> -q8 --no-mtp   (drop --no-mtp
 # for the MTP variant; MTP is on by default whenever the GGUF ships nextn).
 
-./llama-server -m /media/hnvcam/AI/LLAMA_Models/Qwen3.8-27B-UD-Q4_K_M.gguf \
+./llama-server -m /media/hnvcam/AI/LLAMA_Models/Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf \
   -ngl 99 \
   -dev CUDA0,CUDA1 \
-  -ts 0.75,0.25 \
-  -c 110592 \
-  -ub 256 \
+  -ts 0.73,0.27 \
+  -c 131072 \
+  -ub 512 \
   -np 1 \
   -kvu \
   -ctk q8_0 \
   -ctv q8_0 \
   --spec-type draft-mtp \
-  --spec-draft-n-max 3 \
   -fa on \
-  --mmproj /media/hnvcam/AI/LLAMA_Models/Qwen3.8-27B-mmproj-Q5_K.gguf \
-  --temp 1.0 --top-p 0.95 --top-k 20 \
+  --mmproj /media/hnvcam/AI/LLAMA_Models/Tiel-Coder-35B-A3B-mmproj-Q8_0.gguf \
+  --temp 0.6 --top-p 0.95 --top-k 20 \
   --port 1234
 
 cd ~/Workplace/llama-cli
