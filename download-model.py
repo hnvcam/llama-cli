@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-download-model.py - Download a GGUF (or any file) from Hugging Face Hub with
-a bandwidth cap, since `hf download` has no rate-limit option.
+download-model.py - Download a GGUF (or any file), or a whole folder, from
+Hugging Face Hub with a bandwidth cap, since `hf download` has no rate-limit option.
 
 Accepts a link in any of these forms:
   - hf://<org>/<repo>/<path/to/file.gguf>
@@ -9,14 +9,23 @@ Accepts a link in any of these forms:
   - hf download hf://<org>/<repo>/<path/to/file.gguf>   (paste of the full hf-cli command)
   - https://huggingface.co/<org>/<repo>/resolve/main/<path/to/file.gguf>
   - https://huggingface.co/<org>/<repo>/blob/main/<path/to/file.gguf>
+  - https://huggingface.co/<org>/<repo>/tree/main/<folder>   (whole folder, recursively)
+  - hf://<org>/<repo>/tree/main/<folder>
+
+A folder link downloads every file in it, mirroring the repo paths under --path,
+so split GGUF shards stay together. Interrupt and rerun the same command to resume.
 
 Examples:
   ./download-model.py hf://mradermacher/Hy-MT2-30B-A3B-i1-GGUF/Hy-MT2-30B-A3B.i1-Q5_K_M.gguf
   ./download-model.py "hf download hf://mradermacher/Hy-MT2-30B-A3B-i1-GGUF/Hy-MT2-30B-A3B.i1-Q5_K_M.gguf" --limit 10M
   ./download-model.py https://huggingface.co/org/repo/resolve/main/file.gguf --path /data/models
+  ./download-model.py https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ4_XS
+  ./download-model.py https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main --include '*.gguf'
 """
 
 import argparse
+import fnmatch
+import json
 import os
 import re
 import sys
@@ -92,7 +101,7 @@ def human_bytes_decimal(n):
 
 
 def parse_link(raw):
-    """Return (repo_type, repo_id, filename, revision) from any supported link form."""
+    """Return (repo_type, repo_id, path, revision, is_dir) from any supported link form."""
     link = raw.strip().strip("'\"")
     link = re.sub(r"^hf\s+download\s+", "", link, flags=re.IGNORECASE).strip()
 
@@ -108,8 +117,17 @@ def parse_link(raw):
         if len(parts) < 3:
             raise ValueError(f"Can't find <org>/<repo>/<file> in '{link}'")
         repo_id = "/".join(parts[:2])
-        filename = "/".join(parts[2:])
-        return repo_type, repo_id, filename, revision
+        rest = parts[2:]
+        if rest and rest[0] == "tree":
+            rest = rest[1:]
+            if rest:
+                revision = rest[0]
+                rest = rest[1:]
+            if not rest:
+                raise ValueError(f"Can't find a folder path in '{link}'")
+            return repo_type, repo_id, "/".join(rest), revision, True
+        filename = "/".join(rest)
+        return repo_type, repo_id, filename, revision, False
 
     if link.startswith("http://") or link.startswith("https://"):
         m = re.match(r"^https?://huggingface\.co/(.+)$", link)
@@ -124,20 +142,22 @@ def parse_link(raw):
             raise ValueError(f"Can't find <org>/<repo> in '{link}'")
         repo_id = "/".join(parts[:2])
         rest = parts[2:]
-        if rest and rest[0] in ("resolve", "blob"):
+        is_dir = bool(rest and rest[0] == "tree")
+        if rest and rest[0] in ("resolve", "blob", "tree"):
             rest = rest[1:]
             if rest:
                 revision = rest[0]
                 rest = rest[1:]
         if not rest:
+            if is_dir:
+                return repo_type, repo_id, "", revision, True  # repo root
             raise ValueError(f"Can't find a file path in '{link}'")
-        filename = "/".join(rest)
-        return repo_type, repo_id, filename, revision
+        return repo_type, repo_id, "/".join(rest), revision, is_dir
 
     raise ValueError(
         f"Unrecognized link format: '{raw}'\n"
         "Expected hf://org/repo/file.gguf, a pasted 'hf download hf://...' command, "
-        "or a https://huggingface.co/... URL."
+        "or a https://huggingface.co/... URL (resolve/blob/tree)."
     )
 
 
@@ -146,6 +166,53 @@ def build_url(repo_type, repo_id, filename, revision):
     # URL-encode path segments but keep slashes.
     encoded = "/".join(urllib.request.quote(p) for p in filename.split("/"))
     return f"https://huggingface.co/{prefix}{repo_id}/resolve/{revision}/{encoded}"
+
+
+API_PREFIX = {"model": "models/", "dataset": "datasets/", "space": "spaces/"}
+SKIP_NAMES = (".gitattributes",)
+
+
+def api_get(url, token):
+    req = urllib.request.Request(url)
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        resp = urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise RuntimeError(
+                f"HTTP {e.code} listing the repo — it may be gated/private. "
+                "Set HF_TOKEN in .env or the environment."
+            ) from e
+        if e.code == 404:
+            raise RuntimeError(f"HTTP 404 — repo or folder not found at {url}") from e
+        raise RuntimeError(f"HTTP {e.code} fetching {url}: {e.reason}") from e
+    with resp:
+        entries = json.loads(resp.read().decode("utf-8"))
+        link = resp.headers.get("Link") or ""
+    next_url = None
+    m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+    if m:
+        next_url = m.group(1)
+    return entries, next_url
+
+
+def list_folder(repo_type, repo_id, folder, revision, token):
+    """List every file under `folder` (recursively) as (path, size) pairs."""
+    encoded = "/".join(urllib.request.quote(p) for p in folder.split("/") if p)
+    url = (f"https://huggingface.co/api/{API_PREFIX[repo_type]}{repo_id}"
+           f"/tree/{revision}/{encoded}?recursive=true")
+    files = []
+    while url:
+        entries, url = api_get(url, token)
+        for e in entries:
+            if e.get("type") != "file":
+                continue
+            path = e["path"]
+            if os.path.basename(path) in SKIP_NAMES:
+                continue
+            files.append((path, e.get("size")))
+    return files
 
 
 def get_remote_size(url, token):
@@ -277,7 +344,7 @@ def main():
     load_env_file(os.path.join(SCRIPT_DIR, ".env"))
 
     parser = argparse.ArgumentParser(
-        description="Download a model file from Hugging Face Hub with a bandwidth cap.",
+        description="Download a model file or folder from Hugging Face Hub with a bandwidth cap.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -291,25 +358,45 @@ def main():
                          help="HF access token (else HF_TOKEN from .env or the environment)")
     parser.add_argument("--force", action="store_true",
                          help="Re-download from scratch even if a (partial) file already exists")
+    parser.add_argument("--include", action="append", default=None, metavar="GLOB",
+                         help="Only download folder files matching this glob (repeatable), "
+                              "e.g. --include '*.gguf'")
     args = parser.parse_args()
 
     raw_link = " ".join(args.link)
     try:
         limit_bytes = parse_limit(args.limit)
-        repo_type, repo_id, filename, revision = parse_link(raw_link)
+        repo_type, repo_id, path, revision, is_dir = parse_link(raw_link)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     token = args.token or os.environ.get("HF_TOKEN") or None
-    url = build_url(repo_type, repo_id, filename, revision)
-    dest = os.path.join(args.path, os.path.basename(filename))
 
     print(f"Repo: {repo_id} ({repo_type}, rev={revision})")
-    print(f"File: {filename}")
 
     try:
-        download(url, dest, token, limit_bytes, args.force)
+        if is_dir:
+            print(f"Folder: {path or '<repo root>'}")
+            files = list_folder(repo_type, repo_id, path, revision, token)
+            if args.include:
+                files = [(p, s) for p, s in files
+                         if any(fnmatch.fnmatch(p, g) for g in args.include)]
+            if not files:
+                print("Error: no files in that folder"
+                      + (" match --include" if args.include else "") + ".", file=sys.stderr)
+                sys.exit(1)
+            total = sum(s or 0 for _, s in files)
+            print(f"{len(files)} file(s), {human_bytes_decimal(total)} ({human_bytes(total)})")
+            for i, (rel, _) in enumerate(files, 1):
+                print(f"\n[{i}/{len(files)}] {rel}")
+                download(build_url(repo_type, repo_id, rel, revision),
+                         os.path.join(args.path, rel), token, limit_bytes, args.force)
+        else:
+            print(f"File: {path}")
+            download(build_url(repo_type, repo_id, path, revision),
+                     os.path.join(args.path, os.path.basename(path)),
+                     token, limit_bytes, args.force)
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
