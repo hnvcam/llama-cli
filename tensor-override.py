@@ -28,7 +28,8 @@ card SEPARATELY (weights + its share of the KV cache + its share of the
 recurrent state + its own full compute buffer), and reports the largest `-c`
 that fits together with the `-ts` that balances the two cards. See dense_report().
 
-Every model, dense or MoE, ALSO gets a `-sm tensor` plan (tensor parallelism).
+Models also get a `-sm tensor` plan, except for shared-KV external drafts whose
+cache backend cannot safely be mixed with the target's Meta device.
 That is usually the faster way to run two cards, because the cards work
 concurrently instead of taking turns, and it makes `-ts` a speed knob whose
 optimum is ts_i = BW_i / sum(BW), read out of gpu-bandwidth.json. Careful,
@@ -51,6 +52,9 @@ Usage:
     ./tensor-override.py MODEL.gguf [-q8] [-c CTX] [options]
     ./tensor-override.py MODEL.gguf -q8            # best-fit context
     ./tensor-override.py MODEL.gguf -q8 -c 65535   # spill to RAM if need be
+    ./tensor-override.py MODEL.gguf --mtp-model mtp-MODEL-Q8_0.gguf
+        # MTP from an external sidecar GGUF (--spec-draft-model), for targets
+        # with no nextn block of their own; see MTP_SIDECAR.
 """
 
 import argparse
@@ -60,6 +64,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -773,6 +778,75 @@ MTP_KV_FILTERED_ARCHS = {"qwen35", "qwen35moe", "step35", "hy_v3"}
 # high against the 115.01 MiB measured on LongCat. Use --measure for the real value.
 MTP_COMPUTE_ESTIMATE = 256 * MiB
 
+# Sidecar archs that READ the target's KV cache instead of allocating their
+# own: llama-model.cpp:2663 hands the sidecar's cache mem_other =
+# llama_get_memory(ctx_other) and maps every one of its layers with
+# `share = [](il) { return n_layer(target) - 1 or -2; }`, and llama-kv-cache.cpp
+# then pushes the shared tensors and `continue`s without creating new ones.
+# An external MTP sidecar of these archs therefore costs ZERO KV cache --
+# unlike an embedded nextn block, which re-caches every attention layer.
+SHARED_KV_DRAFT_ARCHS = {"gemma4-assistant", "eagle3", "dflash"}
+
+# Set by main() when --mtp-model names an external MTP .gguf, e.g.
+# mtp-gemma-4-31B-it-Q8_0.gguf for a target that ships no nextn block of its
+# own. While it is set the MTP pricing stops being "duplicate the target's KV
+# over the nextn block" and becomes the sidecar's own bill: its weights, plus a
+# draft KV only if its arch is not in the list above, plus the draft context's
+# compute buffer. Charge these to --mtp-device, along with any cross-GPU cache
+# transfer scratch. Gemma draft commands expose both backends and use a tensor
+# override to keep all weights on the requested GPU.
+MTP_SIDECAR = None
+
+# Device to pin the sidecar weights to. Default CUDA0; --mtp-device overrides.
+# "none" omits the flag entirely -- llama.cpp then follows -dev and the sidecar
+# layer-splits across the cards (the bill stays worst-cased on CUDA0).
+MTP_DRAFT_DEV = "CUDA0"
+
+
+def mtp_draft_dev_idx():
+    """Which card carries the sidecar bill: 0 for CUDA0/none, 1 for CUDA1."""
+    return 1 if MTP_DRAFT_DEV == "CUDA1" else 0
+
+
+def load_mtp_sidecar(path):
+    """Parse the external MTP .gguf passed to --mtp-model."""
+    md, ts = read_gguf(path)
+    arch = md.get("general.architecture", "?")
+    # Gemma4Assistant normally duplicates the CPU input embedding for GPU
+    # output. Our draft tensor override puts both uses on the same GPU, where
+    # the loader deduplicates them: count the embedding once, not twice.
+    weights = sum(t.nbytes for t in ts)
+    embedding = next((t.nbytes for t in ts if t.name == "token_embd.weight"), 0)
+    if arch != "gemma4-assistant" and any(t.name == "output.weight" for t in ts):
+        weights -= embedding
+    return {
+        "path": path,
+        "arch": arch,
+        "label": str(md.get("general.size_label") or md.get("general.name") or ""),
+        "n_block": int(md.get(arch + ".block_count", 0) or 0),
+        "weights": weights,
+        # Gemma shared-KV commands override ALL draft tensors to the selected
+        # GPU. The loader reuses that embedding for output in the same buffer.
+        "cpu_weights": 0 if arch == "gemma4-assistant" else embedding,
+        "shares_kv": arch in SHARED_KV_DRAFT_ARCHS,
+        "info": analyse(md, ts),   # for the non-sharing KV fallback only
+    }
+
+
+def mtp_draft_bytes(info, n_ctx, n_seq, n_ubatch, unified, swa_full):
+    """
+    What the "MTP draft KV" line of the accounting actually costs:
+    with --mtp-model, the sidecar's weights (+ its own KV, roughly priced from
+    its hparams, only when its arch does not share the target cache); without,
+    the second context's KV cache over the target's layers.
+    """
+    if MTP_SIDECAR is not None:
+        d = MTP_SIDECAR
+        kv = 0 if d["shares_kv"] else mtp_kv_cache_bytes(
+            d["info"], n_ctx, None, n_seq, n_ubatch, unified, swa_full)
+        return d["weights"] + kv
+    return mtp_kv_cache_bytes(info, n_ctx, None, n_seq, n_ubatch, unified, swa_full)
+
 
 def mtp_kv_cache_bytes(info, n_ctx, kv_type_id=None, n_seq=1, n_ubatch=512,
                        unified=True, swa_full=False):
@@ -867,6 +941,10 @@ COMPUTE_BUF_RE = re.compile(
 # is the section terminator for the compute-buffer sizes printed just above it.
 GRAPH_NODES_RE = re.compile(r"sched_reserve:\s+graph nodes\s*=")
 MTP_CTX_RE = re.compile(r"creating MTP draft context")
+# The external-sidecar path (--spec-draft-model FNAME --spec-type draft-mtp)
+# never prints the marker above -- speculative.cpp:2560 logs 'loading draft
+# model' instead -- so both flip the section split.
+DRAFT_MODEL_RE = re.compile(r"loading draft model")
 # Emitted once everything is allocated; nothing further is reserved after it.
 SERVER_READY_RE = re.compile(r"listening on http|all slots are idle")
 
@@ -910,7 +988,7 @@ def find_llama_server():
 
 
 def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lookup_names,
-                            mtp_enabled=False):
+                            mtp_enabled=False, command=None):
     """
     Load the model once under a *representative* placement and read the real
     compute buffer sizes out of llama.cpp's own log.
@@ -961,6 +1039,11 @@ def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lo
            "--parallel", str(args.parallel),
            "-kvu" if args.kv_unified else "-no-kvu", "-lv", "5", "--no-ui",
            "--port", str(args.measure_port)]
+    cmd += ["-b", str(args.batch)]
+    if args.swa_full:
+        cmd += ["--swa-full"]
+    if mtp_enabled:
+        cmd += ["--spec-draft-n-max", str(args.draft_max)]
     if probe:
         cmd += ["-ot", ",".join(f"{p}={d}" for p, d in probe)]
     if args.q8:
@@ -968,17 +1051,27 @@ def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lo
     if mtp_enabled:
         # the MTP draft head is part of the graph, so it must be in the probe
         cmd += ["--spec-type", "draft-mtp"]
+        if MTP_SIDECAR is not None:
+            cmd += ["--spec-draft-model", MTP_SIDECAR["path"]]
+            # Shared-KV drafts need visibility of both target CUDA backends.
+            cmd += shlex.split(" ".join(sidecar_device_flags()))
+
+    if command is not None:
+        cmd = [server] + shlex.split(command.replace("\\\n", " "))[1:] + [
+            "-lv", "5", "--no-ui", "--port", str(args.measure_port)]
 
     sys.stderr.write(f"measuring compute buffers via {os.path.basename(server)} "
                      f"(loads the model once, ~1 min)...\n")
     section = {}          # devices seen since the last "graph nodes" line
     target, mtp = {}, {}  # last completed section on each side of the MTP marker
     seen_mtp = False
+    ready, log_tail = False, []
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
     try:
         deadline = time.time() + args.measure_timeout
         for line in proc.stdout:
+            log_tail = (log_tail + [line])[-12:]
             m = COMPUTE_BUF_RE.search(line)
             if m:
                 section[m.group(1)] = int(float(m.group(2)) * MiB)
@@ -989,9 +1082,10 @@ def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lo
                     else:
                         target = section
                 section = {}
-            elif MTP_CTX_RE.search(line):
+            elif MTP_CTX_RE.search(line) or DRAFT_MODEL_RE.search(line):
                 seen_mtp = True
             if SERVER_READY_RE.search(line):
+                ready = True
                 break
             if "out of memory" in line or "exiting due to" in line:
                 break
@@ -1004,6 +1098,10 @@ def measure_compute_buffers(args, model_path, expert_layers, expert_suffixes, lo
             proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
+
+    if not ready:
+        raise SystemExit("error: measurement server did not reach readiness:\n" + "".join(log_tail))
 
     if "CUDA0" not in target:
         raise SystemExit("error: could not read a CUDA0 compute buffer size from llama-server; "
@@ -1176,8 +1274,8 @@ def moe_compute_growth(info, args, n_ctx, base_ctx, mtp_enabled):
     grow = moe_mask_bytes(info, args, n_ctx) - moe_mask_bytes(info, args, base_ctx)
     mtp_grow = 0
     if mtp_enabled:
-        mtp_grow = (mtp_compute_buffer(info, n_ctx, args.ubatch, args.parallel)
-                    - mtp_compute_buffer(info, base_ctx, args.ubatch, args.parallel))
+        mtp_grow = (sidecar_compute_buffer(info, args, n_ctx)
+                    - sidecar_compute_buffer(info, args, base_ctx))
     return max(grow, 0), max(mtp_grow, 0)
 
 
@@ -1205,13 +1303,22 @@ def moe_fit(info, args, n_ctx, kv_type, expert_layers, expert_bytes, lookup_byte
     """Price the -ot plan at exactly one context. None if it cannot fit at all."""
     kv_bytes = kv_cache_bytes(info, n_ctx, kv_type, None, args.parallel,
                               args.ubatch, args.kv_unified, args.swa_full)
-    mtp_kv_bytes = (mtp_kv_cache_bytes(info, n_ctx, None, args.parallel,
-                                       args.ubatch, args.kv_unified, args.swa_full)
+    mtp_kv_bytes = (mtp_draft_bytes(info, n_ctx, args.parallel, args.ubatch,
+                                    args.kv_unified, args.swa_full)
                     if mtp_enabled else 0)
     growth, mtp_growth = moe_compute_growth(info, args, n_ctx, base_ctx, mtp_enabled)
     compute_bytes = compute_base + growth
     mtp_compute_bytes = mtp_compute_base + mtp_growth
-    fixed0 = kv_bytes + recr_bytes + compute_bytes + mtp_kv_bytes + mtp_compute_bytes
+    if mtp_enabled and MTP_SIDECAR is not None:
+        mtp_compute_bytes += sidecar_transfer_bytes(info, args, n_ctx, kv_type, lambda il: 0)
+    fixed0 = kv_bytes + recr_bytes + compute_bytes
+    # Both MTP terms are 0 unless MTP is on. Built-in nextn lives with the
+    # core tensors on CUDA0; an external sidecar follows its pinned card
+    # (--mtp-device) and is billed there instead.
+    mtp_fixed = mtp_kv_bytes + mtp_compute_bytes
+    sidecar_on_cuda1 = MTP_SIDECAR is not None and mtp_draft_dev_idx() == 1
+    if not sidecar_on_cuda1:
+        fixed0 += mtp_fixed
     # CUDA1 holds only expert weights, but it still takes part in the graph and
     # so allocates its own compute buffer. Measured 328.06 MiB (Ling) and
     # 150.07 MiB (LongCat), so a fraction of CUDA0's with a floor.
@@ -1225,7 +1332,10 @@ def moe_fit(info, args, n_ctx, kv_type, expert_layers, expert_bytes, lookup_byte
     # The MTP graph only touches the nextn block, whose weights are core tensors
     # pinned to CUDA0, so llama.cpp reserves nothing on CUDA1 for it (measured
     # 0.00 MiB on LongCat). Trust a measurement if we have one, add nothing if not.
-    fixed1 += measured_mtp.get("CUDA1", 0)
+    if not sidecar_on_cuda1:
+        fixed1 += measured_mtp.get("CUDA1", 0)
+    if sidecar_on_cuda1:
+        fixed1 += mtp_fixed
 
     packed = pack(expert_layers, expert_bytes, lookup_bytes, core_bytes,
                   fixed0, fixed1, gpu0_budget, gpu1_budget)
@@ -1420,10 +1530,19 @@ def mtp_compute_buffer(info, n_ctx, n_ubatch, n_seq):
     return MTP_COMPUTE_BASE + kv_size * n_ubatch * 2 * max(n_seq, 1)
 
 
-def dense_compute_buffer(info, n_ctx, n_ubatch, n_seq, base=None):
+def dense_compute_buffer(info, n_ctx, n_ubatch, n_seq, base=None,
+                         n_batch=2048, unified=True, swa_full=False):
     """Per-card compute buffer for a dense layer split. Same size on every card."""
     kv_size = int(math.ceil(n_ctx / 256.0) * 256)
     mask = kv_size * n_ubatch * 4 * max(n_seq, 1) if info.main_kv_layers else 0
+    if info.arch == "gemma4":
+        # Gemma's iSWA graph reserves masks for BOTH caches at logical batch
+        # size, with f32 and f16 copies on a layer-split backend. Measured at
+        # -b 2048 -ub 512 -np 1: 522.20 MiB at 32K, 978.20 MiB at 70K.
+        # 121 MiB + (base_cells + swa_cells)*2048*6 predicts 523/979 MiB.
+        cells, swa_cells, _ = kv_cell_counts(info, n_ctx, n_seq, n_ubatch,
+                                            unified, swa_full)
+        mask = (cells + (swa_cells if info.swa_layers else 0)) * min(n_batch, kv_size) * 6
     return (DENSE_COMPUTE_BASE if base is None else base) + mask
 
 
@@ -1550,14 +1669,23 @@ def dense_fit(info, args, layer_bytes, out_bytes, budgets, n_ctx, kv_type,
     for il in info.recr_layers:
         recr[dev(il)] += rs_per_layer
 
-    compute = dense_compute_buffer(info, n_ctx, args.ubatch, args.parallel, compute_base)
+    compute = dense_compute_buffer(info, n_ctx, args.ubatch, args.parallel, compute_base,
+                                    args.batch, args.kv_unified, args.swa_full)
 
     mtp = [0, 0]
-    if mtp_enabled:
+    if mtp_enabled and MTP_SIDECAR is not None:
+        # The sidecar's own weights, KV (if any), graph scratch, and shared-KV
+        # transfer scratch all belong to the requested draft device.
+        di = mtp_draft_dev_idx()
+        mtp[di] += mtp_draft_bytes(info, n_ctx, args.parallel, args.ubatch,
+                                   args.kv_unified, args.swa_full)
+        mtp[di] += sidecar_compute_buffer(info, args, n_ctx)
+        mtp[di] += sidecar_transfer_bytes(info, args, n_ctx, kv_type, dev)
+    elif mtp_enabled:
         # The draft context's KV follows the blocks it caches, at f16, and its
         # compute buffer lands on the card that holds those blocks -- not CUDA0.
         # llama-server prints the split itself:
-        #   [spec] adding   0.00 MiB to fit_params_target for device CUDA0
+        #   srv load_model: [spec] adding   0.00 MiB to fit_params_target for device CUDA0
         #   [spec] adding 714.06 MiB to fit_params_target for device CUDA1
         cached = (info.kv_layers[-info.n_nextn:]
                   if info.arch in MTP_KV_FILTERED_ARCHS and info.n_nextn
@@ -1590,7 +1718,7 @@ def plan_dense_split(info, args, layer_bytes, out_bytes, budgets, n_ctx, kv_type
     for boundary in range(0, n_split + 1):
         fit = dense_fit(info, args, layer_bytes, out_bytes, budgets, n_ctx, kv_type,
                         boundary, compute_base, mtp_enabled)
-        if fit.fits() and (best is None or fit.slack > best.slack):
+        if fit is not None and fit.fits() and (best is None or fit.slack > best.slack):
             best = fit
     return best
 
@@ -2112,6 +2240,26 @@ def tensor_compute_buffer(info, args, n_ctx, base=None):
     return mask + TENSOR_SCRATCH_PER_UB * args.ubatch
 
 
+def sidecar_compute_buffer(info, args, n_ctx):
+    if MTP_SIDECAR is not None and MTP_SIDECAR["arch"] == "gemma4-assistant":
+        # Shared KV saves cache allocations, but not the context-sized masks.
+        return (tensor_compute_buffer(info, args, n_ctx) + 64 * MiB
+                + getattr(args, "dense_mtp_extra", 0))
+    return mtp_compute_buffer(info, n_ctx, args.ubatch, args.parallel)
+
+
+def sidecar_transfer_bytes(info, args, n_ctx, kv_type, owner):
+    """Scratch for reading shared target KV from a different draft GPU."""
+    if MTP_SIDECAR is None or MTP_SIDECAR["arch"] != "gemma4-assistant":
+        return 0
+    cells, swa_cells, _ = kv_cell_counts(info, n_ctx, args.parallel, args.ubatch,
+                                        args.kv_unified, args.swa_full)
+    return sum(layer_kv_bytes(info, il, kv_type,
+                              swa_cells if il in info.swa_layers else cells)
+               for il in (info.n_layer_all - 2, info.n_layer_all - 1)
+               if il in info.main_kv_layers and owner(il) != mtp_draft_dev_idx())
+
+
 @dataclass
 class SplitMaps:
     """
@@ -2324,6 +2472,10 @@ def tensor_fit(info, args, maps, budgets, gpus, cpu_bw, n_ctx, kv_type,
     expert tensors are only two granularities wide that under-counted CUDA0 by
     1.2 GiB and produced plans that OOM on load.
     """
+    if mtp_enabled and MTP_SIDECAR is not None and MTP_SIDECAR["shares_kv"]:
+        # A pinned CUDA draft cannot schedule the target's Meta() KV buffers.
+        # Do not recommend a configuration that aborts before server startup.
+        return None
     n_all = info.n_layer_all
     i_gpu_start = max(0, min(n_cpu_blocks, n_all))
     on_gpu = lambda il: il is None or il >= i_gpu_start
@@ -2373,7 +2525,15 @@ def tensor_fit(info, args, maps, budgets, gpus, cpu_bw, n_ctx, kv_type,
             rs_items.append((key, row_size(0, width) * args.parallel * (1 + n_rs_seq)))
 
     compute = tensor_compute_buffer(info, args, n_ctx, compute_base)
-    if mtp_enabled:
+    sidecar_extra, sidecar_i, sidecar_compute = 0, 0, 0
+    if mtp_enabled and MTP_SIDECAR is not None:
+        # Shared-KV sidecars were rejected above. Other external drafts carry
+        # their own weights, KV and compute on the requested draft card.
+        sidecar_compute = sidecar_compute_buffer(info, args, n_ctx)
+        sidecar_extra = mtp_draft_bytes(info, n_ctx, args.parallel, args.ubatch,
+                                        args.kv_unified, args.swa_full)
+        sidecar_i = mtp_draft_dev_idx()
+    elif mtp_enabled:
         compute += mtp_compute_buffer(info, n_ctx, args.ubatch, args.parallel)
         cached = (info.kv_layers[-info.n_nextn:]
                   if info.arch in MTP_KV_FILTERED_ARCHS and info.n_nextn
@@ -2401,9 +2561,12 @@ def tensor_fit(info, args, maps, budgets, gpus, cpu_bw, n_ctx, kv_type,
         share = lambda key: split_fracs(key, ts)
         w = [gpu_mirror + sum(share(k)[i] * nb for k, nb in sliced.items())
              for i in (0, 1)]
+        w[sidecar_i] += sidecar_extra
         kv = [sum(share(k)[i] * nb for k, nb in kv_items) for i in (0, 1)]
         rs = [sum(share(k)[i] * nb for k, nb in rs_items) for i in (0, 1)]
-        used = tuple(w[i] + kv[i] + rs[i] + compute for i in (0, 1))
+        used = tuple(w[i] + kv[i] + rs[i] + compute
+                     + (sidecar_compute if sidecar_extra and i == sidecar_i else 0)
+                     for i in (0, 1))
         act = [act_mirror + sum(share(k)[i] * nb for k, nb in active.items())
                for i in (0, 1)]
         per_card = [act[i] / (gpus[i].bw * 1e9 * MBU_TENSOR) for i in (0, 1)]
@@ -2524,12 +2687,36 @@ def parallel_flags(args):
     (common.h:563), which resizes the KV cache out from under the plan. So the
     command always states both.
     """
-    return [f"-np {args.parallel}", "-kvu" if args.kv_unified else "-no-kvu"]
+    flags = [f"-np {args.parallel}", "-kvu" if args.kv_unified else "-no-kvu",
+             f"-b {args.batch}"]
+    if args.swa_full:
+        flags.append("--swa-full")
+    return flags
+
+
+def speculative_flags(args, mtp_enabled):
+    if not mtp_enabled:
+        return []
+    flags = ["--spec-type draft-mtp", f"--spec-draft-n-max {args.draft_max}"]
+    if MTP_SIDECAR is not None:
+        flags.append("--spec-draft-model " + shlex.quote(MTP_SIDECAR["path"]))
+        flags += sidecar_device_flags()
+    return flags
+
+
+def sidecar_device_flags():
+    if MTP_SIDECAR is not None and MTP_SIDECAR["arch"] == "gemma4-assistant":
+        # Register both backends to access shared KV on either card, while
+        # keeping every draft weight on the requested GPU. A single-device
+        # draft aborts on a shared cache allocated by the other device.
+        return ["--spec-draft-device CUDA0,CUDA1",
+                "--spec-draft-override-tensor " + shlex.quote(".*=" + MTP_DRAFT_DEV)]
+    return ["--spec-draft-device " + MTP_DRAFT_DEV] if MTP_DRAFT_DEV != "none" else []
 
 
 def tensor_command(args, n_ctx, q8, mtp_enabled, fit, ot_flags=None):
     """The llama-server invocation for a -sm tensor plan."""
-    parts = [f"{args.server_bin} -m {args.model}",
+    parts = [f"{shlex.quote(args.server_bin)} -m {shlex.quote(args.model)}",
              f"-ngl {fit.n_gpu_layers if fit.n_cpu_blocks else 99}",
              "-dev CUDA0,CUDA1", "-sm tensor", f"-ts {fmt_ts(fit.ts)}",
              f"-c {n_ctx}", f"-ub {args.ubatch}"]
@@ -2538,8 +2725,7 @@ def tensor_command(args, n_ctx, q8, mtp_enabled, fit, ot_flags=None):
         parts += ["-ctk q8_0", "-ctv q8_0"]
     if ot_flags:
         parts += [render_ot(ot_flags)] if isinstance(ot_flags, list) else [ot_flags]
-    if mtp_enabled:
-        parts += ["--spec-type draft-mtp"]
+    parts += speculative_flags(args, mtp_enabled)
     parts += ["-fa on"]
     return " \\\n  ".join(parts)
 
@@ -2555,6 +2741,11 @@ def tensor_report(args, info, gpus, tensors, budgets, kv_name, kv_type,
     every block on the GPU is reported instead.
     """
     e = sys.stderr.write
+    if mtp_enabled and MTP_SIDECAR is not None and MTP_SIDECAR["shares_kv"]:
+        e("Skipping -sm tensor: this shared-KV draft cannot consume the target's\n"
+          "Meta() cache through a pinned CUDA backend. Use a layer split, or\n"
+          "--no-mtp for tensor parallelism.\n\n")
+        return 0, None
     maps = tensor_split_maps(tensors, info, kv_type)
 
     e("=" * 74 + "\n")
@@ -2659,11 +2850,36 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
     ctx_cap = n_ctx_train or 1 << 20
     n_live = info.n_layer_all - len(info.dead_layers)
 
-    variants = []      # (flag, kv name, kv type, max n_ctx, DenseFit)
-    for flag, (kv_name, kv_type) in (("", KV_TYPE_F16), ("-q8", KV_TYPE_Q8_0)):
-        ctx, fit = max_ctx_dense(info, args, layer_bytes, out_bytes, budgets, kv_type,
-                                 compute_base, mtp_enabled, ctx_cap)
-        variants.append((flag, kv_name, kv_type, ctx, fit))
+    def make_variants():
+        variants = []
+        for flag, (kv_name, kv_type) in (("", KV_TYPE_F16), ("-q8", KV_TYPE_Q8_0)):
+            if args.ctx_requested is None:
+                ctx, fit = max_ctx_dense(info, args, layer_bytes, out_bytes, budgets, kv_type,
+                                         compute_base, mtp_enabled, ctx_cap)
+            else:
+                fit = plan_dense_split(info, args, layer_bytes, out_bytes, budgets,
+                                       args.ctx_requested, kv_type, compute_base, mtp_enabled)
+                ctx = args.ctx_requested if fit else 0
+            variants.append((flag, kv_name, kv_type, ctx, fit))
+        return variants
+
+    variants = make_variants()
+    if args.measure and args.compute_buf is None:
+        selected = variants[1 if args.q8 else 0]
+        if selected[4] is None:
+            raise SystemExit("error: no feasible dense layer split to measure; lower -c or use a smaller model")
+        measured, measured_mtp = measure_compute_buffers(
+            args, args.model, [], set(), [], mtp_enabled,
+            command=dense_command(args, selected[3], args.q8, mtp_enabled, selected[4]))
+        mask = dense_compute_buffer(info, selected[3], args.ubatch, args.parallel, 0,
+                                     args.batch, args.kv_unified, args.swa_full)
+        compute_base = max(0, max(measured.values()) - mask)
+        if measured_mtp and MTP_SIDECAR is not None:
+            args.dense_mtp_extra = max(0, max(measured_mtp.values())
+                                       - (selected[4].mtp[mtp_draft_dev_idx()]
+                                          - MTP_SIDECAR["weights"]))
+        compute_src = "measured"
+        variants = make_variants()
 
     if args.json:
         print(json.dumps({
@@ -2677,6 +2893,8 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
             "is_mla": info.is_mla,
             "mtp_enabled": mtp_enabled,
             "mtp_capable": info.mtp_capable,
+            "mtp_model": (MTP_SIDECAR["path"]
+                          if mtp_enabled and MTP_SIDECAR else None),
             "rs_rollback_depth": rs_rollback_depth(info, args, mtp_enabled),
             "n_ctx_train": n_ctx_train,
             "bytes": {
@@ -2687,7 +2905,7 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
                 "budget_cuda0": budgets[0],
                 "budget_cuda1": budgets[1],
             },
-            "max_ctx": {
+            "requested_ctx" if args.ctx_requested is not None else "max_ctx": {
                 kv_name: None if not ctx else {
                     "n_ctx": ctx,
                     "tensor_split": list(fit.ts),
@@ -2698,6 +2916,7 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
                     "cuda1": {"used": fit.used[1], "budget": fit.budget[1],
                               "weights": fit.weights[1], "kv": fit.kv[1],
                               "recurrent": fit.recr[1], "compute": fit.compute},
+                    "mtp": list(fit.mtp),
                 }
                 for _, kv_name, _, ctx, fit in variants},
             "ot": [],
@@ -2720,7 +2939,27 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
       f"                -ot would only move hot weights to a slower card. Let\n"
       f"                llama.cpp split by layer across CUDA0+CUDA1 instead; this\n"
       f"                report sizes that split card by card.\n")
-    if mtp_enabled:
+    if mtp_enabled and MTP_SIDECAR is not None:
+        d = MTP_SIDECAR
+        kv_txt = ("shares the target's KV cache (llama-model.cpp hands it "
+                  "mem_other), so it allocates\n"
+                  f"                NONE of its own" if d["shares_kv"] else
+                  "allocates its own draft KV, priced from its hparams")
+        e(f"MTP           : ENABLED via external sidecar {os.path.basename(d['path'])}"
+          f" -- {d['arch']}, {d['n_block']} block(s),\n"
+          f"                {fmt_mib(d['weights'])} GPU weights, {fmt_mib(d['cpu_weights'])} CPU embedding"
+          f"{' (' + d['label'] + ')' if d['label'] else ''}.\n"
+          f"                The commands carry --spec-type draft-mtp --spec-draft-model. "
+          f"The sidecar\n"
+          f"                {kv_txt}; priced into the -c\n"
+          f"                figures below are its weights plus the draft context's compute "
+          f"buffer, on "
+          + (f"{MTP_DRAFT_DEV} -- the commands keep its weights there."
+             if MTP_DRAFT_DEV != "none" else
+             "CUDA0 worst-case -- unpinned (--mtp-device none), llama.cpp may "
+             "split it over --device.")
+          + f" Use --no-mtp to reclaim all of it.\n")
+    elif mtp_enabled:
         dup = "a full duplicate" if info.arch not in MTP_KV_FILTERED_ARCHS \
             else f"{info.n_nextn} nextn layer(s)"
         n_rs_seq = rs_rollback_depth(info, args, mtp_enabled)
@@ -2766,6 +3005,9 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
     e("\n")
 
     if not any(ctx for _, _, _, ctx, _ in variants):
+        if args.ctx_requested is not None:
+            raise SystemExit(f"error: requested -c {args.ctx_requested} does not fit a GPU-only layer split; "
+                             "lower -c or use a smaller model (no command emitted)")
         e(f"No context fits. {fmt_gib(gpu_weight_bytes)} of weights against "
           f"{fmt_mib(sum(budgets))} of budget\n"
           f"leaves no room -- use a smaller quant, or drop -ngl below {n_live}.\n")
@@ -2786,7 +3028,8 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
                 (f"recurrent state ({args.parallel} seq)", fit.recr),
                 (f"compute buffer ({compute_src})", (fit.compute, fit.compute))]
         if mtp_enabled:
-            rows.append(("MTP draft context", fit.mtp))
+            rows.append(("MTP sidecar + draft ctx" if MTP_SIDECAR is not None
+                         else "MTP draft context", fit.mtp))
         for label, pair in rows:
             if not any(pair):
                 continue
@@ -2802,7 +3045,7 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
         e("\n")
 
     # What MTP is actually costing, in tokens of context, for the selected KV type.
-    if mtp_enabled and chosen[3]:
+    if mtp_enabled and chosen[3] and args.ctx_requested is None:
         info_off = analyse(md, tensors, use_mtp=False)
         lb_off, ob_off, _ = dense_weight_map(tensors, info_off)
         ctx_off, _ = max_ctx_dense(info_off, args, lb_off, ob_off, budgets, chosen[2],
@@ -2813,8 +3056,10 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
               f"that is a throughput question this script cannot answer -- benchmark both.\n\n")
 
     if compute_src == "derived":
-        e("The compute-buffer figure is n_kv*n_ubatch*4*n_seq of KQ mask plus "
-          f"{fmt_mib(DENSE_COMPUTE_BASE)} of\n"
+        e(("The Gemma compute estimate includes both iSWA masks at -b, f32+f16, plus "
+           if info.arch == "gemma4" else
+           "The compute-buffer figure is n_kv*n_ubatch*4*n_seq of KQ mask plus ")
+          + f"{fmt_mib(DENSE_COMPUTE_BASE)} of\n"
           "activation scratch, matched to two measured points on this box. If a load\n"
           "still OOMs, read the real 'compute buffer size' out of llama-server -lv 5\n"
           "and pass its ub-only part via --compute-buf.\n")
@@ -2859,7 +3104,7 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
     layer_cmd = None
     if chosen[3]:
         layer_cmd = dense_command(args, chosen[3], args.q8, mtp_enabled, chosen[4])
-    elif variants[1][3]:
+    elif variants[1][3] and args.ctx_requested is None:
         layer_cmd = dense_command(args, variants[1][3], True, mtp_enabled, variants[1][4])
     tensor_cmd = (tensor_command(args, tensor_ctx, chosen[2] == KV_TYPE_Q8_0[1],
                                  mtp_enabled, tensor_fit_sel)
@@ -2884,19 +3129,20 @@ def dense_report(args, md, info, gpus, tensors, weights_bytes, mtp_enabled, cpu_
     elif layer_cmd:
         emit_commands(layer_cmd, [(f"-sm tensor, -c {tensor_ctx}",
                                    tensor_cmd, "--prefer tensor")])
+    else:
+        raise SystemExit(f"error: selected KV type {chosen[1]} does not fit at the requested context")
 
 
 def dense_command(args, n_ctx, q8, mtp_enabled, fit=None):
     """The llama-server invocation for a dense two-card layer split."""
-    parts = [f"{args.server_bin} -m {args.model}", "-ngl 99", "-dev CUDA0,CUDA1"]
+    parts = [f"{shlex.quote(args.server_bin)} -m {shlex.quote(args.model)}", "-ngl 99", "-dev CUDA0,CUDA1"]
     if fit is not None:
         parts.append(f"-ts {fmt_ts(fit.ts)}")
     parts += [f"-c {n_ctx}", f"-ub {args.ubatch}"]
     parts += parallel_flags(args)
     if q8:
         parts += ["-ctk q8_0", "-ctv q8_0"]
-    if mtp_enabled:
-        parts += ["--spec-type draft-mtp"]
+    parts += speculative_flags(args, mtp_enabled)
     parts += ["-fa on"]
     return " \\\n  ".join(parts)
 
@@ -3024,9 +3270,23 @@ def main():
     ap.add_argument("--no-mtp", dest="mtp", action="store_false", default=True,
                     help="do NOT use the model's MTP/nextn blocks. By default, if the GGUF ships "
                          "nextn tensors the plan budgets for them and the command carries "
-                         "--spec-type draft-mtp.")
+                         "--spec-type draft-mtp. Also disables an --mtp-model sidecar.")
+    ap.add_argument("--mtp-model", metavar="FNAME", default=None,
+                    help="external MTP sidecar GGUF, e.g. mtp-gemma-4-31B-it-Q8_0.gguf, for "
+                         "models that ship NO nextn block of their own. Emitted as "
+                         "--spec-type draft-mtp --spec-draft-model FNAME. Its weights, draft "
+                         "KV (zero when the sidecar shares the target's cache, e.g. "
+                         "gemma4-assistant) and compute buffer are priced onto CUDA0.")
+    ap.add_argument("--mtp-device", metavar="DEV", default="auto",
+                    help="card to pin the --mtp-model sidecar on, emitted as "
+                         "--spec-draft-device DEV and where its bill is priced "
+                         "(default: auto, which uses CUDA0). Shared-KV Gemma drafts "
+                         "keep both backends visible and pin weights using a draft tensor "
+                         "override. none omits the pin (not supported "
+                         "for shared-KV drafts). Sidecar "
+                         "only -- a built-in nextn block follows the target.")
     ap.add_argument("--draft-max", type=int, default=3,
-                    help="llama.cpp's --draft-max, i.e. how many tokens MTP drafts per step "
+                    help="llama.cpp's --spec-draft-n-max, i.e. how many tokens MTP drafts per step "
                          "(default 3, matching common_params_speculative_draft::n_max). On a "
                          "recurrent arch this is also cparams.n_rs_seq, so the recurrent state "
                          "is sized for 1+N copies -- +1795 MiB on Qwen3.8-27B at the default.")
@@ -3047,7 +3307,7 @@ def main():
                          "only -- in a dense layer split both cards allocate the same size, "
                          "so this is ignored there.")
     ap.add_argument("--measure", action="store_true",
-                    help="load the model once with -cmoe and read the REAL compute buffer sizes "
+                    help="load a representative placement once and read the REAL compute buffer sizes "
                          "from llama.cpp instead of estimating. Strongly recommended: the "
                          "estimate does not generalise across architectures.")
     ap.add_argument("--llama-server", default=None,
@@ -3085,9 +3345,42 @@ def main():
 
     md, tensors = read_gguf(args.model)
     info = analyse(md, tensors, use_mtp=args.mtp)
-    # MTP is on whenever the model can do it, unless --no-mtp. It costs the
-    # nextn block's weights in VRAM, which the plan below budgets for.
-    mtp_enabled = args.mtp and info.mtp_capable
+
+    global MTP_SIDECAR, MTP_DRAFT_DEV
+    MTP_SIDECAR, MTP_DRAFT_DEV = None, "CUDA0"
+    if args.mtp_device.lower() == "default":
+        args.mtp_device = "auto"
+    if args.mtp_device not in ("auto", "CUDA0", "CUDA1", "none"):
+        raise SystemExit(f"error: --mtp-device must be auto, CUDA0, CUDA1 or none, "
+                         f"not {args.mtp_device!r}")
+    if args.mtp_model:
+        if not args.mtp:
+            raise SystemExit("error: --mtp-model given together with --no-mtp; "
+                             "drop one of them")
+        if not os.path.exists(args.mtp_model):
+            raise SystemExit(f"error: no such file: {args.mtp_model}")
+        MTP_SIDECAR = load_mtp_sidecar(args.mtp_model)
+        if args.mtp_device == "auto":
+            MTP_DRAFT_DEV = "CUDA0"
+        else:
+            MTP_DRAFT_DEV = args.mtp_device
+        if MTP_SIDECAR["shares_kv"] and MTP_DRAFT_DEV == "none":
+            raise SystemExit("error: shared-KV drafts require --mtp-device auto, CUDA0 or CUDA1; "
+                             "unpinned placement is not modeled safely")
+        if MTP_SIDECAR["arch"] == "gemma4-assistant" and info.arch != "gemma4":
+            raise SystemExit("error: a gemma4-assistant sidecar requires a gemma4 target")
+        if info.mtp_capable:
+            sys.stderr.write(
+                f"warning: {os.path.basename(args.model)} already ships its own nextn "
+                f"block; llama.cpp prefers\n         --spec-draft-model, so the built-in "
+                f"block stays dead weight\n")
+    elif args.mtp_device not in ("auto", "CUDA0"):
+        sys.stderr.write("warning: --mtp-device without --mtp-model has no effect "
+                         "(a built-in nextn block follows --device)\n")
+    # MTP is on whenever the model can do it (built-in nextn or --mtp-model),
+    # unless --no-mtp. It costs the nextn block's weights in VRAM, which the
+    # plan below budgets for.
+    mtp_enabled = args.mtp and (info.mtp_capable or MTP_SIDECAR is not None)
 
     gpus = detect_gpus()
     if args.use_total_vram:
@@ -3162,9 +3455,10 @@ def main():
     if not mtp_enabled:
         mtp_compute_bytes = 0
     elif measured_mtp:
-        mtp_compute_bytes = measured_mtp.get("CUDA0", 0)
+        mtp_compute_bytes = measured_mtp.get(f"CUDA{mtp_draft_dev_idx()}", 0)
     else:
-        mtp_compute_bytes = MTP_COMPUTE_ESTIMATE
+        mtp_compute_bytes = (sidecar_compute_buffer(info, args, args.ctx)
+                             if MTP_SIDECAR is not None else MTP_COMPUTE_ESTIMATE)
 
     gpu0_budget = gpus[0].budget_bytes - args.reserve0 * MiB
     gpu1_budget = gpus[1].budget_bytes - args.reserve1 * MiB
@@ -3209,8 +3503,8 @@ def main():
         # that made the plan infeasible.
         kv_bytes = kv_cache_bytes(info, args.ctx, kv_type, None, args.parallel,
                                   args.ubatch, args.kv_unified, args.swa_full)
-        mtp_kv_bytes = (mtp_kv_cache_bytes(info, args.ctx, None, args.parallel,
-                                           args.ubatch, args.kv_unified, args.swa_full)
+        mtp_kv_bytes = (mtp_draft_bytes(info, args.ctx, args.parallel, args.ubatch,
+                                        args.kv_unified, args.swa_full)
                         if mtp_enabled else 0)
         fixed0 = kv_bytes + recr_bytes + compute_bytes + mtp_kv_bytes + mtp_compute_bytes
 
@@ -3224,7 +3518,9 @@ def main():
         e(f"  recurrent state ({args.parallel} seq)".ljust(38) + f"{fmt_mib(recr_bytes):>12}\n")
         e(f"  compute buffer".ljust(38) + f"{fmt_mib(compute_bytes):>12}\n")
         if mtp_enabled:
-            e(f"  MTP draft context (KV + compute)".ljust(38)
+            lbl = ("  MTP sidecar (weights + compute)" if MTP_SIDECAR is not None
+                   else "  MTP draft context (KV + compute)")
+            e(lbl.ljust(38)
               + f"{fmt_mib(mtp_kv_bytes + mtp_compute_bytes):>12}\n")
         e(f"  non-expert weights that must be resident".ljust(38)
           + f"{fmt_mib(core_bytes):>12}\n")
@@ -3273,6 +3569,8 @@ def main():
                              else "max-gpu-resident" if ctx_note and "largest" in ctx_note
                              else "fallback-not-gpu-resident"),
             "mtp_enabled": mtp_enabled,
+            "mtp_model": (MTP_SIDECAR["path"]
+                          if mtp_enabled and MTP_SIDECAR else None),
             "bytes": {
                 "weights_total": weights_bytes,
                 "core": plan.core_bytes,
@@ -3316,7 +3614,22 @@ def main():
       + (f", {n_dense} other" if n_dense else "") + "\n")
     e(f"MoE           : {info.n_expert} experts, {info.n_expert_used} used/token, "
       f"{len(expert_layers)} layers carry expert tensors\n")
-    if mtp_enabled:
+    if mtp_enabled and MTP_SIDECAR is not None:
+        d = MTP_SIDECAR
+        kv_txt = ("it shares the target's KV cache and allocates none of its own"
+                  if d["shares_kv"] else
+                  "it allocates its own draft KV, priced from its hparams")
+        pin = " ".join(sidecar_device_flags()) or "no pin (--mtp-device none)"
+        where = MTP_DRAFT_DEV if MTP_DRAFT_DEV != "none" else "CUDA0 (worst case)"
+        e(f"MTP           : ENABLED via external sidecar {os.path.basename(d['path'])}"
+          f" -- {d['arch']}, {d['n_block']} block(s).\n"
+          f"                The command carries --spec-type draft-mtp --spec-draft-model "
+          f"with {pin}.\n"
+          f"                Because {d['arch']} {kv_txt}, the sidecar costs\n"
+          f"                +{fmt_mib(mtp_kv_bytes)} weights + "
+          f"{fmt_mib(mtp_compute_bytes)} compute, both on {where}. Use "
+          f"--no-mtp to reclaim.\n")
+    elif mtp_enabled:
         dup = "a full duplicate" if info.arch not in MTP_KV_FILTERED_ARCHS \
             else f"{info.n_nextn} nextn layer(s)"
         e(f"MTP           : ENABLED -- {info.n_nextn} nextn block(s) present, so the command\n"
@@ -3409,10 +3722,9 @@ def main():
     llama_args += parallel_flags(args)
     if args.q8:
         llama_args += ["-ctk q8_0", "-ctv q8_0"]
-    if mtp_enabled:
-        llama_args += ["--spec-type draft-mtp"]
+    llama_args += speculative_flags(args, mtp_enabled)
 
-    head = f"{args.server_bin} -m " + args.model
+    head = f"{shlex.quote(args.server_bin)} -m {shlex.quote(args.model)}"
     if fits_entirely:
         e("=> No tensor override needed: the whole model + KV cache fits on CUDA0 + CUDA1.\n")
         e("   Let llama.cpp do its own layer split.\n\n")

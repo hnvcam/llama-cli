@@ -110,9 +110,27 @@ gives you a runnable script and still shows you the reasoning.
 
 ### MTP / speculative decoding
 
+For Gemma 4 with an external assistant, use `--mtp-model PATH --mtp-device CUDA0`
+(CUDA0 is also the default). The generated layer-split command exposes both CUDA
+backends and emits `--spec-draft-override-tensor '.*=CUDA0'`, keeping all draft
+weights on CUDA0 while allowing access to target KV tensors on CUDA1. A
+single-device `--spec-draft-device CUDA0` crashes when those shared tensors live
+on CUDA1. `--mtp-device CUDA1` remains available.
+
+The planner includes the draft's GPU weights, compute masks, and cross-GPU cache
+copies. With this shared-KV assistant it skips the `-sm tensor` alternative;
+`--no-mtp` enables planning tensor parallelism again. Dense `-c` requests are
+preserved, and `--measure` probes the planned layer split. Gemma's layer-split
+compute estimate includes both iSWA masks at logical batch size (`-b`), rather
+than the smaller physical batch size (`-ub`). See `gemma4-31b.sh` for a verified
+CUDA0 MTP launch configuration.
+
 | Flag | Default | What it does |
 | --- | --- | --- |
 | `--no-mtp` | MTP is **on** | Do not use the model's MTP/nextn blocks. By default, if the GGUF actually ships `nextn` tensors, the plan budgets VRAM for them and the emitted command carries `--spec-type draft-mtp`. |
+| `--mtp-model PATH` | none | External assistant GGUF. Its weights and draft context are included in the budget. |
+| `--mtp-device DEV` | `auto` → `CUDA0` | GPU holding the assistant weights; accepts `CUDA0` or `CUDA1`. |
+| `--draft-max N` | `3` | Maximum draft tokens per step, emitted as `--spec-draft-n-max N`. |
 
 See [Should you use MTP?](#should-you-use-mtp) below — for any model that has to
 spill experts to CPU, **I recommend `--no-mtp`**.
