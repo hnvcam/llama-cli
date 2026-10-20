@@ -10,6 +10,7 @@
 | File | What it is |
 | --- | --- |
 | `tensor-override.py` | Computes llama.cpp `-ot` tensor overrides for large MoE models that do not fit in VRAM, and prints a ready-to-run `llama-server` command line. |
+| `qwen3.6-35b-a3b.sh` | Starts the shared Strata API and web chat using `../Strata/strata-qwen36-ud-q4_k_xl.json`: 128K context, Q8 KV, 2K prefill, 14 CPU threads and greedy MTP. API: `http://127.0.0.1:1234/v1`; web chat: `http://127.0.0.1:1234/`. |
 | `BUILD-LLAMA.md` | How I build llama.cpp with CUDA. |
 | `ling-flash.sh`, `kat-coder.sh` | Launch scripts for two specific models, generated from the planner's output and then frozen. |
 | `CLI-HELP.md`, `SERVER-HELP.md` | Dumps of `llama-cli --help` / `llama-server --help` for the build I use, so I can grep flags without launching anything. |
