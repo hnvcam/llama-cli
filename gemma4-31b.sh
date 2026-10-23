@@ -42,19 +42,19 @@ cd ~/Workplace/llama.cpp/build/bin/
 ./llama-server -m /media/hnvcam/AI/LLAMA_Models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf \
   -ngl 99 \
   -dev CUDA0,CUDA1 \
-  -ts 0.6803,0.3197 \
-  -c 47104 \
-  -ub 512 \
+  -ts 0.7623,0.2377 \
+  -c 32768 \
+  -ub 2048 \
   -np 1 \
   -kvu \
   -b 2048 \
   -ctk q8_0 \
   -ctv q8_0 \
   --spec-type draft-mtp \
-  --spec-draft-n-max 3 \
+  --spec-draft-n-max 2 \
   --spec-draft-model /media/hnvcam/AI/LLAMA_Models/mtp-gemma-4-31B-it-Q8_0.gguf \
   --spec-draft-device CUDA0,CUDA1 \
-  --spec-draft-override-tensor '.*=CUDA0' \
+  --spec-draft-override-tensor '.*=CUDA1' \
   -fa on \
   --temp 1.0 --top-p 0.95 --top-k 64 \
   --port 1234
